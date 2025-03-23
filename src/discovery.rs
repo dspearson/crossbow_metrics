@@ -330,18 +330,16 @@ async fn build_zone_interface_map(
             //     physical: http0
             //     vlan-id not specified
 
-            let mut current_physical = None;
-
             for line in zonecfg_text.lines() {
                 let line = line.trim();
 
                 if line.starts_with("physical:") {
                     // Extract interface name after "physical:"
                     if let Some(iface_name) = line.split(':').nth(1) {
-                        current_physical = Some(iface_name.trim().to_string());
+                        let interface_name = iface_name.trim().to_string();
 
-                        println!("  Found interface {} in zone {}", current_physical.as_ref().unwrap(), zone_name);
-                        zone_interface_map.insert(current_physical.clone().unwrap(), *zone_uuid);
+                        println!("  Found interface {} in zone {}", interface_name, zone_name);
+                        zone_interface_map.insert(interface_name, *zone_uuid);
                     }
                 }
             }
@@ -390,11 +388,15 @@ async fn build_zone_interface_map(
         println!("WARNING: No zone-interface mappings found!");
     } else {
         println!("Built zone-interface map with {} entries:", zone_interface_map.len());
+
         for (interface, zone_uuid) in &zone_interface_map {
             // Find zone name for the UUID
+            // Create a longer-lived string to avoid the borrowing issue
+            let unknown = "unknown".to_string();
+
             let zone_name = zones.iter()
-                .find_map(|(name, id)| if *id == zone_uuid { Some(name) } else { None })
-                .unwrap_or(&"unknown".to_string());
+                .find_map(|(name, id)| if id == zone_uuid { Some(name) } else { None })
+                .unwrap_or(&unknown);
 
             println!("  Interface {} → Zone {} ({})", interface, zone_name, zone_uuid);
         }
