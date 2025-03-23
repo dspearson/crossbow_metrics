@@ -7,7 +7,6 @@ mod models;
 use anyhow::{Context, Result};
 use clap::Parser;
 use config::{AppConfig, Args};
-use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -38,9 +37,6 @@ async fn main() -> Result<()> {
 
     // Connect to the database with TLS support
     let client = database::establish_connection(&db_url, &config.database.sslmode).await?;
-
-    // Ensure host exists in the database before proceeding
-    let _ = database::ensure_host_exists(Arc::clone(&client), &hostname, max_retries).await?;
 
     // Start the metrics collection loop
     metrics::collect_metrics(client, interval, max_retries, &hostname).await?;
