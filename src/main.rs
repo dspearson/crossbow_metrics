@@ -48,7 +48,7 @@ async fn main() -> Result<()> {
     // Discover interfaces and build a mapping
     let interface_map = discovery::discover_interfaces(Arc::clone(&client), host_id, &zones, max_retries).await?;
 
-    // Start the metrics collection loop
+    // Start the metrics collection loop with the hostname
     metrics::collect_metrics(client, &interface_map, interval, max_retries, &hostname).await?;
 
     Ok(())

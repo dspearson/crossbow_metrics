@@ -1,4 +1,3 @@
-// src/models.rs
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
@@ -12,7 +11,7 @@ pub struct NetworkInterface {
     pub parent_interface: Option<String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct NetworkMetric {
     pub interface_name: String,
     pub input_bytes: i64,

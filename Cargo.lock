@@ -332,6 +332,7 @@ dependencies = [
  "chrono",
  "clap",
  "config",
+ "libc",
  "native-tls",
  "postgres-native-tls",
  "postgres-types",
