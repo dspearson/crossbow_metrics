@@ -98,12 +98,12 @@ pub async fn discover_zones(client: Arc<Client>, host_id: Uuid, max_retries: usi
 pub async fn discover_interfaces(
     client: Arc<Client>,
     host_id: Uuid,
-    _zones: &HashMap<String, Uuid>,  // Prefixed with underscore to indicate intentional non-use
+    zones: &HashMap<String, Uuid>,
     max_retries: usize,
 ) -> Result<HashMap<String, NetworkInterface>> {
     let mut interfaces = HashMap::new();
 
-    // Get physical interfaces using dladm
+    // First, get physical interfaces
     let output = Command::new("/usr/sbin/dladm")
         .args(&["show-phys", "-p", "-o", "link,class,state,mtu"])
         .output()
@@ -142,44 +142,106 @@ pub async fn discover_interfaces(
     }
 
     // Get virtual interfaces (VNICs)
-    let output = Command::new("/usr/sbin/dladm")
+    let vnic_output = Command::new("/usr/sbin/dladm")
         .args(&["show-vnic", "-p", "-o", "link,over"])
         .output()
         .context("Failed to run dladm show-vnic command")?;
 
-    let vnic_output = String::from_utf8(output.stdout)
+    let vnic_output = String::from_utf8(vnic_output.stdout)
         .context("Invalid UTF-8 in dladm vnic output")?;
 
-    // Process VNICs
+    // Build a mapping of VNICs to their parent interfaces
+    let mut vnic_parents = HashMap::new();
     for line in vnic_output.lines() {
         let fields: Vec<&str> = line.split(':').collect();
         if fields.len() >= 2 {
             let interface_name = fields[0].to_string();
             let parent_interface = fields[1].to_string();
-
-            // Attempt to determine which zone this VNIC belongs to
-            let zone_id = None;
-
-            // Store interface in database and get UUID
-            let interface_id = ensure_interface_exists(
-                Arc::clone(&client),
-                host_id,
-                zone_id,
-                interface_name.clone(),
-                "vnic".to_string(),
-                Some(parent_interface.clone()),
-                max_retries,
-            ).await?;
-
-            interfaces.insert(interface_name.clone(), NetworkInterface {
-                interface_id,
-                host_id,
-                zone_id,
-                interface_name,
-                interface_type: "vnic".to_string(),
-                parent_interface: Some(parent_interface),
-            });
+            vnic_parents.insert(interface_name, parent_interface);
         }
+    }
+
+    // Now get zone information - for each zone, check which VNICs are assigned to it
+    for (zone_name, zone_id) in zones {
+        // Skip global zone as we'll assign unmatched VNICs to it later
+        if zone_name == "global" {
+            continue;
+        }
+
+        // Get network interfaces for this zone
+        let zone_nics = Command::new("/usr/sbin/zonecfg")
+            .args(&["-z", zone_name, "info", "net"])
+            .output()
+            .context(format!("Failed to run zonecfg for zone {}", zone_name))?;
+
+        let zone_nics_output = String::from_utf8(zone_nics.stdout)
+            .context("Invalid UTF-8 in zonecfg output")?;
+
+        // Parse zonecfg output to find zone network interfaces
+        let mut current_vnic = None;
+        for line in zone_nics_output.lines() {
+            let line = line.trim();
+
+            if line.starts_with("net:") {
+                current_vnic = None;
+            } else if line.starts_with("physical:") {
+                // Extract the interface name from "physical: vnic_name"
+                if let Some(vnic_name) = line.strip_prefix("physical:") {
+                    current_vnic = Some(vnic_name.trim().to_string());
+                }
+            }
+
+            // When we have identified a VNIC for this zone
+            if let Some(vnic_name) = &current_vnic {
+                let parent_interface = vnic_parents.get(vnic_name).cloned();
+
+                // Store interface in database and get UUID
+                let interface_id = ensure_interface_exists(
+                    Arc::clone(&client),
+                    host_id,
+                    Some(*zone_id),
+                    vnic_name.clone(),
+                    "vnic".to_string(),
+                    parent_interface.clone(),
+                    max_retries,
+                ).await?;
+
+                interfaces.insert(vnic_name.clone(), NetworkInterface {
+                    interface_id,
+                    host_id,
+                    zone_id: Some(*zone_id),
+                    interface_name: vnic_name.clone(),
+                    interface_type: "vnic".to_string(),
+                    parent_interface,
+                });
+
+                // Remove from vnic_parents so we don't process it twice
+                vnic_parents.remove(vnic_name);
+            }
+        }
+    }
+
+    // Process remaining VNICs (those not assigned to a specific zone)
+    for (vnic_name, parent_interface) in vnic_parents {
+        // Store interface in database and get UUID
+        let interface_id = ensure_interface_exists(
+            Arc::clone(&client),
+            host_id,
+            None, // No specific zone - belongs to global zone
+            vnic_name.clone(),
+            "vnic".to_string(),
+            Some(parent_interface.clone()),
+            max_retries,
+        ).await?;
+
+        interfaces.insert(vnic_name.clone(), NetworkInterface {
+            interface_id,
+            host_id,
+            zone_id: None,
+            interface_name: vnic_name,
+            interface_type: "vnic".to_string(),
+            parent_interface: Some(parent_interface),
+        });
     }
 
     // Check for etherstubs as well
