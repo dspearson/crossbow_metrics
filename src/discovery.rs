@@ -289,9 +289,11 @@ pub async fn discover_interfaces(
 // This is a new function to build the mapping between interface names and zone IDs
 async fn build_zone_interface_map(
     zones: &HashMap<String, Uuid>,
-    verbose: bool,
+    _verbose: bool,
 ) -> Result<HashMap<String, Uuid>> {
     let mut zone_interface_map = HashMap::new();
+
+    println!("Building zone-interface map with {} zones", zones.len());
 
     // First, find out which zones are running
     let output = Command::new("/usr/sbin/zoneadm")
@@ -302,6 +304,12 @@ async fn build_zone_interface_map(
     let zone_output = String::from_utf8(output.stdout)
         .context("Invalid UTF-8 in zoneadm output")?;
 
+    // Debug: Show raw zoneadm output
+    println!("Raw zoneadm output:");
+    for line in zone_output.lines() {
+        println!("  {}", line);
+    }
+
     // Process each running zone (except global) to get its associated VNICs
     for line in zone_output.lines() {
         let fields: Vec<&str> = line.split(':').collect();
@@ -310,14 +318,22 @@ async fn build_zone_interface_map(
             let zone_name = fields[1].to_string();
             let zone_status = fields[2].to_string();
 
+            println!("Processing zone: {} (status: {})", zone_name, zone_status);
+
             // Skip if zone is not running or is global
             if zone_status != "running" || zone_name == "global" {
+                println!("  Skipping zone (not running or global zone)");
                 continue;
             }
 
             // Get zone UUID from our map
             if let Some(zone_uuid) = zones.get(&zone_name) {
+                println!("  Found zone UUID: {}", zone_uuid);
+
                 // Get VNICs for this specific zone
+                let vnic_cmd = format!("/usr/sbin/dladm show-vnic -p -z {} -o link", zone_name);
+                println!("  Running command: {}", vnic_cmd);
+
                 let vnic_output = Command::new("/usr/sbin/dladm")
                     .args(&["show-vnic", "-p", "-z", &zone_name, "-o", "link"])
                     .output()
@@ -326,29 +342,48 @@ async fn build_zone_interface_map(
                 let vnic_text = String::from_utf8(vnic_output.stdout)
                     .context("Invalid UTF-8 in dladm vnic output")?;
 
+                // Debug: Show raw dladm output
+                println!("  Raw dladm show-vnic output for zone {}:", zone_name);
+                for line in vnic_text.lines() {
+                    println!("    {}", line);
+                }
+
                 // Map each VNIC to this zone's UUID
                 for vnic_line in vnic_text.lines() {
                     let vnic_name = vnic_line.trim();
                     if !vnic_name.is_empty() {
+                        println!("  Associating VNIC {} with zone {}", vnic_name, zone_name);
                         zone_interface_map.insert(vnic_name.to_string(), *zone_uuid);
-                        if verbose {
-                            println!("Associated VNIC {} with zone {}", vnic_name, zone_name);
-                        }
                     }
                 }
+
+                // If we didn't find any VNICs, show stderr in case of error
+                if vnic_text.trim().is_empty() {
+                    let stderr = String::from_utf8_lossy(&vnic_output.stderr);
+                    println!("  No VNICs found. stderr: {}", stderr);
+                }
+            } else {
+                println!("  Zone UUID not found for zone: {}", zone_name);
             }
         }
     }
 
     // If we couldn't get zone info with dladm, try another approach with zonecfg
     if zone_interface_map.is_empty() {
+        println!("No interfaces found with dladm, trying zonecfg approach");
+
         for (zone_name, zone_uuid) in zones {
             // Skip global zone
             if zone_name == "global" {
                 continue;
             }
 
+            println!("Trying zonecfg for zone: {}", zone_name);
+
             // Use zonecfg to get interface info - assuming zone has anet resources configured
+            let zonecfg_cmd = format!("/usr/sbin/zonecfg -z {} info anet", zone_name);
+            println!("  Running command: {}", zonecfg_cmd);
+
             let zonecfg_output = Command::new("/usr/sbin/zonecfg")
                 .args(&["-z", zone_name, "info", "anet"])
                 .output();
@@ -356,6 +391,12 @@ async fn build_zone_interface_map(
             // Only process if command succeeded
             if let Ok(output) = zonecfg_output {
                 let anet_text = String::from_utf8_lossy(&output.stdout);
+
+                // Debug: Show raw zonecfg output
+                println!("  Raw zonecfg output for zone {}:", zone_name);
+                for line in anet_text.lines() {
+                    println!("    {}", line);
+                }
 
                 // Parse the output to extract interface names
                 // Format is typically: name: <vnic_name>
@@ -368,19 +409,25 @@ async fn build_zone_interface_map(
                     if line.contains("name:") {
                         if let Some(vnic_name) = line.split(':').nth(1) {
                             let vnic_name = vnic_name.trim();
+                            println!("  From zonecfg: Associating VNIC {} with zone {}", vnic_name, zone_name);
                             zone_interface_map.insert(vnic_name.to_string(), *zone_uuid);
-                            if verbose {
-                                println!("From zonecfg: Associated VNIC {} with zone {}", vnic_name, zone_name);
-                            }
                         }
                     }
                 }
+            } else if let Err(e) = &zonecfg_output {
+                println!("  Error running zonecfg for {}: {}", zone_name, e);
             }
         }
     }
 
-    if verbose {
-        println!("Built zone-interface map with {} entries", zone_interface_map.len());
+    println!("Zone-interface map built with {} entries", zone_interface_map.len());
+
+    // Display the entire map for debugging
+    if !zone_interface_map.is_empty() {
+        println!("Zone-interface map contents:");
+        for (interface, zone_id) in &zone_interface_map {
+            println!("  Interface {} → Zone ID {}", interface, zone_id);
+        }
     }
 
     Ok(zone_interface_map)
