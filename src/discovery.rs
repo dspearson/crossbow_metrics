@@ -117,6 +117,7 @@ async fn get_interface_details(interface_name: &str) -> Result<(Option<String>, 
     Ok((mac_address, mtu))
 }
 
+
 // Helper function to properly format MAC addresses from OmniOS output
 fn format_mac_address(raw_mac: &str) -> Result<String> {
     // For debugging
@@ -597,6 +598,7 @@ async fn build_zone_interface_map(
     Ok(zone_interface_map)
 }
 
+/// Update an interface and track MAC address changes if detected
 pub async fn ensure_interface_exists(
     client: Arc<Client>,
     host_id: Uuid,
@@ -610,85 +612,275 @@ pub async fn ensure_interface_exists(
     let (mac_address, mtu) = get_interface_details(&interface_name).await
         .unwrap_or((None, None));
 
-    // Execute with retry logic
-    let interface_id = execute_with_retry(move || {
-        let client = Arc::clone(&client);
-        let host_id = host_id;
-        let zone_id = zone_id;
-        let interface_name = interface_name.clone();
-        let interface_type = interface_type.clone();
-        let parent_interface = parent_interface.clone();
-        let mac_address = mac_address.clone();
-        let mtu = mtu;
+    debug!("Found details for {}: MAC: {:?}, MTU: {:?}", interface_name, mac_address, mtu);
 
-        Box::pin(async move {
-            let row = client
-                .query_opt(
-                    "SELECT interface_id FROM interfaces
-                     WHERE host_id = $1 AND interface_name = $2 AND (zone_id = $3 OR (zone_id IS NULL AND $3 IS NULL))",
-                    &[&host_id, &interface_name, &zone_id],
+    // First check if interface exists
+    let interface_id = {
+        let client_clone = Arc::clone(&client);
+        let interface_name_clone = interface_name.clone();
+        let host_id_clone = host_id;
+        let zone_id_clone = zone_id;
+
+        execute_with_retry(move || {
+            let client = Arc::clone(&client_clone);
+            let interface_name = interface_name_clone.clone();
+            let host_id = host_id_clone;
+            let zone_id = zone_id_clone;
+
+            Box::pin(async move {
+                let row = client
+                    .query_opt(
+                        "SELECT interface_id FROM interfaces
+                         WHERE host_id = $1 AND interface_name = $2 AND (zone_id = $3 OR (zone_id IS NULL AND $3 IS NULL))",
+                        &[&host_id, &interface_name, &zone_id],
+                    )
+                    .await
+                    .context("Failed to query interface")?;
+
+                let interface_id = match row {
+                    Some(row) => row.get::<_, Uuid>(0),
+                    None => Uuid::new_v4()  // Generate a new ID but don't create the record yet
+                };
+
+                Ok::<_, Error>(interface_id)
+            })
+        }, max_retries)
+        .await?
+    };
+
+    // Check if this is a new interface or existing one
+    let is_new = {
+        let client_clone = Arc::clone(&client);
+        let interface_id_clone = interface_id;
+
+        execute_with_retry(move || {
+            let client = Arc::clone(&client_clone);
+            let interface_id = interface_id_clone;
+
+            Box::pin(async move {
+                let row = client
+                    .query_opt(
+                        "SELECT 1 FROM interfaces WHERE interface_id = $1",
+                        &[&interface_id],
+                    )
+                    .await
+                    .context("Failed to check if interface exists")?;
+
+                Ok::<_, Error>(row.is_none())
+            })
+        }, max_retries)
+        .await?
+    };
+
+    if is_new {
+        // Create new interface
+        let client_clone = Arc::clone(&client);
+        let interface_id_clone = interface_id;
+        let host_id_clone = host_id;
+        let zone_id_clone = zone_id;
+        let interface_name_clone = interface_name.clone();
+        let interface_type_clone = interface_type.clone();
+        let parent_interface_clone = parent_interface.clone();
+        let mac_address_clone = mac_address.clone();
+        let mtu_clone = mtu;
+
+        execute_with_retry(move || {
+            let client = Arc::clone(&client_clone);
+            let interface_id = interface_id_clone;
+            let host_id = host_id_clone;
+            let zone_id = zone_id_clone;
+            let interface_name = interface_name_clone.clone();
+            let interface_type = interface_type_clone.clone();
+            let parent_interface = parent_interface_clone.clone();
+            let mac_address = mac_address_clone.clone();
+            let mtu = mtu_clone;
+
+            Box::pin(async move {
+                client.execute(
+                    "INSERT INTO interfaces (
+                     interface_id, host_id, zone_id, interface_name,
+                     interface_type, parent_interface, mac_address, mtu,
+                     is_active, created_at
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true, CURRENT_TIMESTAMP)",
+                    &[&interface_id, &host_id, &zone_id, &interface_name, &interface_type,
+                      &parent_interface, &mac_address, &mtu],
                 )
                 .await
-                .context("Failed to query interface")?;
+                .context("Failed to insert interface")
+            })
+        }, max_retries)
+        .await?;
 
-            let interface_id = match row {
-                Some(row) => {
-                    let interface_id: Uuid = row.get(0);
-                    // Update interface information
-                    client
-                        .execute(
-                            "UPDATE interfaces SET
-                             interface_type = $1,
-                             parent_interface = $2,
-                             mac_address = $3,
-                             mtu = $4,
-                             is_active = true
-                             WHERE interface_id = $5",
-                            &[&interface_type, &parent_interface, &mac_address, &mtu, &interface_id],
+        // If MAC address is provided, create initial history record
+        if let Some(mac) = &mac_address {
+            let client_clone = Arc::clone(&client);
+            let interface_id_clone = interface_id;
+            let mac_clone = mac.clone();
+
+            execute_with_retry(move || {
+                let client = Arc::clone(&client_clone);
+                let interface_id = interface_id_clone;
+                let mac = mac_clone.clone();
+
+                Box::pin(async move {
+                    client.execute(
+                        "INSERT INTO mac_address_history
+                         (interface_id, mac_address, effective_from, change_reason)
+                         VALUES ($1, $2, CURRENT_TIMESTAMP, $3)",
+                        &[&interface_id, &mac, &"Initial discovery"],
+                    )
+                    .await
+                    .context("Failed to insert initial MAC history record")
+                })
+            }, max_retries)
+            .await?;
+        }
+
+        let zone_desc = match &zone_id {
+            Some(id) => format!("zone ID: {}", id),
+            None => "global zone".to_string(),
+        };
+
+        info!("Created new interface record: {} - {} ({}, MAC: {:?}, MTU: {:?})",
+              interface_name, interface_id, zone_desc, mac_address, mtu);
+    } else {
+        // Check current MAC address to see if it changed
+        let current_mac = {
+            let client_clone = Arc::clone(&client);
+            let interface_id_clone = interface_id;
+
+            execute_with_retry(move || {
+                let client = Arc::clone(&client_clone);
+                let interface_id = interface_id_clone;
+
+                Box::pin(async move {
+                    let row = client
+                        .query_opt(
+                            "SELECT mac_address FROM interfaces WHERE interface_id = $1",
+                            &[&interface_id],
                         )
                         .await
-                        .context("Failed to update interface")?;
+                        .context("Failed to query current MAC address")?;
 
-                    let zone_desc = match &zone_id {
-                        Some(id) => format!("zone ID: {}", id),
-                        None => "global zone".to_string(),
-                    };
+                    let current_mac: Option<String> = row.map(|r| r.get(0));
+                    Ok::<_, Error>(current_mac)
+                })
+            }, max_retries)
+            .await?
+        };
 
-                    trace!("Updated existing interface record: {} - {} ({}, MAC: {:?}, MTU: {:?})",
-                          interface_name, interface_id, zone_desc, mac_address, mtu);
-                    interface_id
-                }
-                None => {
-                    // Create new interface
-                    let interface_id = Uuid::new_v4();
-                    client
-                        .execute(
-                            "INSERT INTO interfaces (
-                             interface_id, host_id, zone_id, interface_name,
-                             interface_type, parent_interface, mac_address, mtu,
-                             is_active, created_at
-                            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true, CURRENT_TIMESTAMP)",
-                            &[&interface_id, &host_id, &zone_id, &interface_name, &interface_type,
-                              &parent_interface, &mac_address, &mtu],
+        // Check if MAC address has changed
+        let mac_changed = match (&current_mac, &mac_address) {
+            (Some(current), Some(new)) => current != new,
+            (None, Some(_)) => true,
+            _ => false,
+        };
+
+        if mac_changed {
+            debug!(
+                "MAC address change detected for interface {}: {} -> {:?}",
+                interface_id,
+                current_mac.as_deref().unwrap_or("None"),
+                mac_address.as_deref().unwrap_or("None")
+            );
+
+            // 1. Close previous MAC history record if exists
+            if let Some(mac) = &current_mac {
+                let client_clone = Arc::clone(&client);
+                let interface_id_clone = interface_id;
+                let mac_clone = mac.clone();
+
+                execute_with_retry(move || {
+                    let client = Arc::clone(&client_clone);
+                    let interface_id = interface_id_clone;
+                    let mac = mac_clone.clone();
+
+                    Box::pin(async move {
+                        client.execute(
+                            "UPDATE mac_address_history
+                             SET effective_to = CURRENT_TIMESTAMP
+                             WHERE interface_id = $1 AND mac_address = $2 AND effective_to IS NULL",
+                            &[&interface_id, &mac],
                         )
                         .await
-                        .context("Failed to insert interface")?;
+                        .context("Failed to close previous MAC history record")
+                    })
+                }, max_retries)
+                .await?;
+            }
 
-                    let zone_desc = match &zone_id {
-                        Some(id) => format!("zone ID: {}", id),
-                        None => "global zone".to_string(),
-                    };
+            // 2. Create new MAC history record
+            if let Some(new_mac) = &mac_address {
+                let client_clone = Arc::clone(&client);
+                let interface_id_clone = interface_id;
+                let new_mac_clone = new_mac.clone();
 
-                    info!("Created new interface record: {} - {} ({}, MAC: {:?}, MTU: {:?})",
-                         interface_name, interface_id, zone_desc, mac_address, mtu);
-                    interface_id
-                }
-            };
+                execute_with_retry(move || {
+                    let client = Arc::clone(&client_clone);
+                    let interface_id = interface_id_clone;
+                    let new_mac = new_mac_clone.clone();
 
-            Ok::<_, Error>(interface_id)
-        })
-    }, max_retries)
-    .await?;
+                    Box::pin(async move {
+                        client.execute(
+                            "INSERT INTO mac_address_history
+                             (interface_id, mac_address, effective_from, change_reason)
+                             VALUES ($1, $2, CURRENT_TIMESTAMP, $3)",
+                            &[&interface_id, &new_mac, &"Discovery update"],
+                        )
+                        .await
+                        .context("Failed to insert new MAC history record")
+                    })
+                }, max_retries)
+                .await?;
+            }
+        }
+
+        // Update interface details
+        let client_clone = Arc::clone(&client);
+        let interface_id_clone = interface_id;
+        let interface_type_clone = interface_type.clone();
+        let parent_interface_clone = parent_interface.clone();
+        let mac_address_clone = mac_address.clone();
+        let mtu_clone = mtu;
+
+        execute_with_retry(move || {
+            let client = Arc::clone(&client_clone);
+            let interface_id = interface_id_clone;
+            let interface_type = interface_type_clone.clone();
+            let parent_interface = parent_interface_clone.clone();
+            let mac_address = mac_address_clone.clone();
+            let mtu = mtu_clone;
+
+            Box::pin(async move {
+                client.execute(
+                    "UPDATE interfaces SET
+                     interface_type = $1,
+                     parent_interface = $2,
+                     mac_address = $3,
+                     mtu = $4,
+                     is_active = true
+                     WHERE interface_id = $5",
+                    &[&interface_type, &parent_interface, &mac_address, &mtu, &interface_id],
+                )
+                .await
+                .context("Failed to update interface")
+            })
+        }, max_retries)
+        .await?;
+
+        let zone_desc = match &zone_id {
+            Some(id) => format!("zone ID: {}", id),
+            None => "global zone".to_string(),
+        };
+
+        if mac_changed {
+            info!("Updated interface record with new MAC: {} - {} ({}, MAC: {:?}, MTU: {:?})",
+                 interface_name, interface_id, zone_desc, mac_address, mtu);
+        } else {
+            trace!("Updated existing interface record: {} - {} ({}, MAC: {:?}, MTU: {:?})",
+                  interface_name, interface_id, zone_desc, mac_address, mtu);
+        }
+    }
 
     Ok(interface_id)
 }
