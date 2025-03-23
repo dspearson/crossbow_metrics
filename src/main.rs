@@ -1,53 +1,19 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, Error};
 use chrono::{DateTime, Utc};
 use clap::Parser;
+use config::{Config, ConfigError, File};
+use rand::random;
+use serde::Deserialize;
 use std::collections::HashMap;
+use std::future::Future;
 use std::io::{BufRead, BufReader};
+use std::pin::Pin;
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::time;
 use tokio_postgres::{Client, NoTls};
 use uuid::Uuid;
-use config::{Config, ConfigError, File};
-use serde::Deserialize;
-
-#[derive(Debug, Deserialize)]
-struct DatabaseConfig {
-    username: String,
-    password: String,
-    host: String,
-    port: u16,
-    database: String,
-    sslmode: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct AppConfig {
-    database: DatabaseConfig,
-    interval: Option<u64>,
-}
-
-impl AppConfig {
-    fn load(config_path: &str) -> Result<Self, ConfigError> {
-        let config = Config::builder()
-            .add_source(File::with_name(config_path))
-            .build()?;
-
-        config.try_deserialize()
-    }
-
-    fn get_connection_string(&self) -> String {
-        format!(
-            "postgresql://{}:{}@{}:{}/{}?sslmode={}",
-            self.database.username,
-            self.database.password,
-            self.database.host,
-            self.database.port,
-            self.database.database,
-            self.database.sslmode
-        )
-    }
-}
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -65,11 +31,55 @@ struct Args {
     interval: Option<u64>,
 }
 
+#[derive(Debug, Deserialize)]
+struct DatabaseConfig {
+    username: String,
+    password: String,
+    hosts: Vec<String>,
+    port: u16,
+    database: String,
+    sslmode: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AppConfig {
+    database: DatabaseConfig,
+    interval: Option<u64>,
+    max_retries: Option<usize>,
+}
+
+impl AppConfig {
+    fn load(config_path: &str) -> Result<Self, ConfigError> {
+        let config = Config::builder()
+            .add_source(File::with_name(config_path))
+            .build()?;
+
+        config.try_deserialize()
+    }
+
+    fn get_connection_string(&self) -> String {
+        // Join multiple hosts with commas
+        let hosts_with_ports: Vec<String> = self.database.hosts
+            .iter()
+            .map(|host| format!("{}:{}", host, self.database.port))
+            .collect();
+
+        let hosts = hosts_with_ports.join(",");
+
+        format!(
+            "postgresql://{}:{}@{}/{}?sslmode={}",
+            self.database.username,
+            self.database.password,
+            hosts,
+            self.database.database,
+            self.database.sslmode
+        )
+    }
+}
+
 #[derive(Debug)]
 struct NetworkInterface {
     interface_id: Uuid,
-    // We only use interface_id in the code, but keep these fields
-    // for potential future use and for clarity about what the struct represents
     #[allow(dead_code)]
     host_id: Uuid,
     #[allow(dead_code)]
@@ -106,6 +116,9 @@ async fn main() -> Result<()> {
     // Get interval from CLI args or config file
     let interval = args.interval.unwrap_or_else(|| config.interval.unwrap_or(60));
 
+    // Get max retries
+    let max_retries = config.max_retries.unwrap_or(5);
+
     // Get system hostname if not provided
     let hostname = match args.hostname {
         Some(h) => h,
@@ -122,6 +135,7 @@ async fn main() -> Result<()> {
 
     println!("Collecting network metrics for host: {}", hostname);
     println!("Collection interval: {} seconds", interval);
+    println!("Database hosts: {}", config.database.hosts.join(", "));
 
     // Connect to the database
     let (client, connection) = tokio_postgres::connect(&db_url, NoTls)
@@ -136,54 +150,101 @@ async fn main() -> Result<()> {
         }
     });
 
+    // Wrap client in Arc for thread-safe sharing
+    let client = Arc::new(client);
+
     // Ensure host exists
-    let host_id = ensure_host_exists(&client, &hostname).await?;
+    let host_id = ensure_host_exists(Arc::clone(&client), &hostname, max_retries).await?;
 
     // Discover zones
-    let zones = discover_zones(&client, host_id).await?;
+    let zones = discover_zones(Arc::clone(&client), host_id, max_retries).await?;
 
     // Discover interfaces and build a mapping
-    let interface_map = discover_interfaces(&client, host_id, &zones).await?;
+    let interface_map = discover_interfaces(Arc::clone(&client), host_id, &zones, max_retries).await?;
 
     // Start the metrics collection loop
-    collect_metrics(&client, &interface_map, interval).await?;
+    collect_metrics(client, &interface_map, interval, max_retries).await?;
 
     Ok(())
 }
 
-async fn ensure_host_exists(client: &Client, hostname: &str) -> Result<Uuid> {
-    // Check if host exists
-    let row = client
-        .query_opt(
-            "SELECT host_id FROM hosts WHERE hostname = $1",
-            &[&hostname],
-        )
-        .await
-        .context("Failed to query host")?;
+async fn execute_with_retry<F, T>(f: F, max_retries: usize) -> Result<T>
+where
+    F: Fn() -> Pin<Box<dyn Future<Output = Result<T>> + Send>> + Send + Sync,
+{
+    let mut retries = 0;
+    let mut delay = Duration::from_millis(100);
 
-    match row {
-        Some(row) => {
-            let host_id: Uuid = row.get(0);
-            println!("Found existing host record: {}", host_id);
-            Ok(host_id)
-        }
-        None => {
-            // Create new host
-            let host_id = Uuid::new_v4();
-            client
-                .execute(
-                    "INSERT INTO hosts (host_id, hostname, created_at) VALUES ($1, $2, CURRENT_TIMESTAMP)",
-                    &[&host_id, &hostname],
-                )
-                .await
-                .context("Failed to insert host")?;
-            println!("Created new host record: {}", host_id);
-            Ok(host_id)
+    loop {
+        match f().await {
+            Ok(result) => return Ok(result),
+            Err(e) => {
+                retries += 1;
+                if retries >= max_retries {
+                    return Err(e);
+                }
+
+                // Log the error and retry
+                eprintln!("Database operation failed (retry {}/{}): {}", retries, max_retries, e);
+                tokio::time::sleep(delay).await;
+
+                // Exponential backoff with jitter
+                delay = Duration::from_millis(
+                    (delay.as_millis() as f64 * 1.5) as u64 +
+                    random::<u64>() % 100
+                );
+            }
         }
     }
 }
 
-async fn discover_zones(client: &Client, host_id: Uuid) -> Result<HashMap<String, Uuid>> {
+async fn ensure_host_exists(client: Arc<Client>, hostname: &str, max_retries: usize) -> Result<Uuid> {
+    // Check if host exists
+    let hostname = hostname.to_string(); // Clone to avoid reference issues
+
+    let host_id = execute_with_retry(move || {
+        let client = Arc::clone(&client);
+        let hostname = hostname.clone();
+
+        Box::pin(async move {
+            let row = client
+                .query_opt(
+                    "SELECT host_id FROM hosts WHERE hostname = $1",
+                    &[&hostname],
+                )
+                .await
+                .context("Failed to query host")?;
+
+            let host_id = match row {
+                Some(row) => {
+                    let host_id: Uuid = row.get(0);
+                    println!("Found existing host record: {}", host_id);
+                    host_id
+                }
+                None => {
+                    // Create new host
+                    let host_id = Uuid::new_v4();
+                    client
+                        .execute(
+                            "INSERT INTO hosts (host_id, hostname, created_at) VALUES ($1, $2, CURRENT_TIMESTAMP)",
+                            &[&host_id, &hostname],
+                        )
+                        .await
+                        .context("Failed to insert host")?;
+                    println!("Created new host record: {}", host_id);
+                    host_id
+                }
+            };
+
+            Ok::<_, Error>(host_id)
+        })
+    }, max_retries)
+    .await?;
+
+    Ok(host_id)
+}
+
+async fn discover_zones(client: Arc<Client>, host_id: Uuid, max_retries: usize) -> Result<HashMap<String, Uuid>> {
     let mut zones = HashMap::new();
 
     // Get zone list from system
@@ -206,45 +267,62 @@ async fn discover_zones(client: &Client, host_id: Uuid) -> Result<HashMap<String
                 None
             };
 
-            // Check if zone exists in database
-            let row = client
-                .query_opt(
-                    "SELECT zone_id FROM zones WHERE host_id = $1 AND zone_name = $2",
-                    &[&host_id, &zone_name],
-                )
-                .await
-                .context("Failed to query zone")?;
+            // Check if zone exists in database with retry logic
+            let zone_client = Arc::clone(&client);
+            let zone_host_id = host_id;
+            let zone_name_clone = zone_name.clone();
+            let zone_status_clone = zone_status.clone();
 
-            let zone_id = match row {
-                Some(row) => {
-                    let id: Uuid = row.get(0);
-                    // Update zone status if available
-                    if let Some(status) = &zone_status {
-                        client
-                            .execute(
-                                "UPDATE zones SET zone_status = $1 WHERE zone_id = $2",
-                                &[status, &id],
-                            )
-                            .await
-                            .context("Failed to update zone status")?;
-                    }
-                    id
-                }
-                None => {
-                    // Create new zone
-                    let id = Uuid::new_v4();
-                    client
-                        .execute(
-                            "INSERT INTO zones (zone_id, host_id, zone_name, zone_status, created_at)
-                             VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)",
-                            &[&id, &host_id, &zone_name, &zone_status],
+            let zone_id = execute_with_retry(move || {
+                let client = Arc::clone(&zone_client);
+                let host_id = zone_host_id;
+                let zone_name = zone_name_clone.clone();
+                let zone_status = zone_status_clone.clone();
+
+                Box::pin(async move {
+                    let row = client
+                        .query_opt(
+                            "SELECT zone_id FROM zones WHERE host_id = $1 AND zone_name = $2",
+                            &[&host_id, &zone_name],
                         )
                         .await
-                        .context("Failed to insert zone")?;
-                    println!("Created new zone record: {} - {}", zone_name, id);
-                    id
-                }
-            };
+                        .context("Failed to query zone")?;
+
+                    let zone_id = match row {
+                        Some(row) => {
+                            let id: Uuid = row.get(0);
+                            // Update zone status if available
+                            if let Some(status) = &zone_status {
+                                client
+                                    .execute(
+                                        "UPDATE zones SET zone_status = $1 WHERE zone_id = $2",
+                                        &[status, &id],
+                                    )
+                                    .await
+                                    .context("Failed to update zone status")?;
+                            }
+                            id
+                        }
+                        None => {
+                            // Create new zone
+                            let id = Uuid::new_v4();
+                            client
+                                .execute(
+                                    "INSERT INTO zones (zone_id, host_id, zone_name, zone_status, created_at)
+                                     VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)",
+                                    &[&id, &host_id, &zone_name, &zone_status],
+                                )
+                                .await
+                                .context("Failed to insert zone")?;
+                            println!("Created new zone record: {} - {}", zone_name, id);
+                            id
+                        }
+                    };
+
+                    Ok::<_, Error>(zone_id)
+                })
+            }, max_retries)
+            .await?;
 
             zones.insert(zone_name, zone_id);
         }
@@ -255,9 +333,10 @@ async fn discover_zones(client: &Client, host_id: Uuid) -> Result<HashMap<String
 }
 
 async fn discover_interfaces(
-    client: &Client,
+    client: Arc<Client>,
     host_id: Uuid,
     _zones: &HashMap<String, Uuid>,
+    max_retries: usize,
 ) -> Result<HashMap<String, NetworkInterface>> {
     let mut interfaces = HashMap::new();
 
@@ -279,12 +358,13 @@ async fn discover_interfaces(
 
             // Store interface in database and get UUID
             let interface_id = ensure_interface_exists(
-                client,
+                Arc::clone(&client),
                 host_id,
                 None, // No zone for physical interfaces
-                &interface_name,
-                &interface_type,
+                interface_name.clone(),
+                interface_type.clone(),
                 None, // No parent for physical interfaces
+                max_retries,
             ).await?;
 
             interfaces.insert(interface_name.clone(), NetworkInterface {
@@ -319,12 +399,13 @@ async fn discover_interfaces(
 
             // Store interface in database and get UUID
             let interface_id = ensure_interface_exists(
-                client,
+                Arc::clone(&client),
                 host_id,
                 zone_id,
-                &interface_name,
-                "vnic",
-                Some(&parent_interface),
+                interface_name.clone(),
+                "vnic".to_string(),
+                Some(parent_interface.clone()),
+                max_retries,
             ).await?;
 
             interfaces.insert(interface_name.clone(), NetworkInterface {
@@ -353,12 +434,13 @@ async fn discover_interfaces(
         if !etherstub_name.is_empty() {
             // Store interface in database and get UUID
             let interface_id = ensure_interface_exists(
-                client,
+                Arc::clone(&client),
                 host_id,
                 None,
-                &etherstub_name,
-                "etherstub",
+                etherstub_name.clone(),
+                "etherstub".to_string(),
                 None,
+                max_retries,
             ).await?;
 
             interfaces.insert(etherstub_name.clone(), NetworkInterface {
@@ -377,63 +459,81 @@ async fn discover_interfaces(
 }
 
 async fn ensure_interface_exists(
-    client: &Client,
+    client: Arc<Client>,
     host_id: Uuid,
     zone_id: Option<Uuid>,
-    interface_name: &str,
-    interface_type: &str,
-    parent_interface: Option<&str>,
+    interface_name: String,
+    interface_type: String,
+    parent_interface: Option<String>,
+    max_retries: usize,
 ) -> Result<Uuid> {
-    // Check if interface exists
-    let row = client
-        .query_opt(
-            "SELECT interface_id FROM interfaces
-             WHERE host_id = $1 AND interface_name = $2 AND (zone_id = $3 OR (zone_id IS NULL AND $3 IS NULL))",
-            &[&host_id, &interface_name, &zone_id],
-        )
-        .await
-        .context("Failed to query interface")?;
+    // Execute with retry logic
+    let interface_id = execute_with_retry(move || {
+        let client = Arc::clone(&client);
+        let host_id = host_id;
+        let zone_id = zone_id;
+        let interface_name = interface_name.clone();
+        let interface_type = interface_type.clone();
+        let parent_interface = parent_interface.clone();
 
-    match row {
-        Some(row) => {
-            let interface_id: Uuid = row.get(0);
-            // Update interface information
-            client
-                .execute(
-                    "UPDATE interfaces SET
-                     interface_type = $1,
-                     parent_interface = $2,
-                     is_active = true
-                     WHERE interface_id = $3",
-                    &[&interface_type, &parent_interface, &interface_id],
+        Box::pin(async move {
+            let row = client
+                .query_opt(
+                    "SELECT interface_id FROM interfaces
+                     WHERE host_id = $1 AND interface_name = $2 AND (zone_id = $3 OR (zone_id IS NULL AND $3 IS NULL))",
+                    &[&host_id, &interface_name, &zone_id],
                 )
                 .await
-                .context("Failed to update interface")?;
-            Ok(interface_id)
-        }
-        None => {
-            // Create new interface
-            let interface_id = Uuid::new_v4();
-            client
-                .execute(
-                    "INSERT INTO interfaces (
-                     interface_id, host_id, zone_id, interface_name,
-                     interface_type, parent_interface, is_active, created_at
-                    ) VALUES ($1, $2, $3, $4, $5, $6, true, CURRENT_TIMESTAMP)",
-                    &[&interface_id, &host_id, &zone_id, &interface_name, &interface_type, &parent_interface],
-                )
-                .await
-                .context("Failed to insert interface")?;
-            println!("Created new interface record: {} - {}", interface_name, interface_id);
-            Ok(interface_id)
-        }
-    }
+                .context("Failed to query interface")?;
+
+            let interface_id = match row {
+                Some(row) => {
+                    let interface_id: Uuid = row.get(0);
+                    // Update interface information
+                    client
+                        .execute(
+                            "UPDATE interfaces SET
+                             interface_type = $1,
+                             parent_interface = $2,
+                             is_active = true
+                             WHERE interface_id = $3",
+                            &[&interface_type, &parent_interface, &interface_id],
+                        )
+                        .await
+                        .context("Failed to update interface")?;
+                    interface_id
+                }
+                None => {
+                    // Create new interface
+                    let interface_id = Uuid::new_v4();
+                    client
+                        .execute(
+                            "INSERT INTO interfaces (
+                             interface_id, host_id, zone_id, interface_name,
+                             interface_type, parent_interface, is_active, created_at
+                            ) VALUES ($1, $2, $3, $4, $5, $6, true, CURRENT_TIMESTAMP)",
+                            &[&interface_id, &host_id, &zone_id, &interface_name, &interface_type, &parent_interface],
+                        )
+                        .await
+                        .context("Failed to insert interface")?;
+                    println!("Created new interface record: {} - {}", interface_name, interface_id);
+                    interface_id
+                }
+            };
+
+            Ok::<_, Error>(interface_id)
+        })
+    }, max_retries)
+    .await?;
+
+    Ok(interface_id)
 }
 
 async fn collect_metrics(
-    client: &Client,
+    client: Arc<Client>,
     interface_map: &HashMap<String, NetworkInterface>,
-    interval_secs: u64,  // This is already u64, so no changes needed
+    interval_secs: u64,
+    max_retries: usize,
 ) -> Result<()> {
     println!("Starting metrics collection with interval: {} seconds", interval_secs);
 
@@ -444,7 +544,7 @@ async fn collect_metrics(
         interval.tick().await;
 
         // Collect metrics using dlstat
-        match collect_dlstat_metrics(client, interface_map).await {
+        match collect_dlstat_metrics(Arc::clone(&client), interface_map, max_retries).await {
             Ok(_) => println!("Successfully collected metrics"),
             Err(e) => eprintln!("Error collecting metrics: {}", e),
         }
@@ -452,8 +552,9 @@ async fn collect_metrics(
 }
 
 async fn collect_dlstat_metrics(
-    client: &Client,
+    client: Arc<Client>,
     interface_map: &HashMap<String, NetworkInterface>,
+    max_retries: usize,
 ) -> Result<()> {
     // First try to use dlstat -i to get interval metrics if available
     let metrics = match collect_from_dlstat_interval().await {
@@ -464,28 +565,42 @@ async fn collect_dlstat_metrics(
         }
     };
 
-    // Store metrics in database
+    // Store metrics in database with retry logic
     for metric in metrics {
         if let Some(interface) = interface_map.get(&metric.interface_name) {
-            client
-                .execute(
-                    "INSERT INTO netmetrics (
-                     interface_id, timestamp,
-                     input_bytes, input_packets, output_bytes, output_packets,
-                     collection_method
-                    ) VALUES ($1, $2, $3, $4, $5, $6, $7)",
-                    &[
-                        &interface.interface_id,
-                        &metric.timestamp,
-                        &metric.input_bytes,
-                        &metric.input_packets,
-                        &metric.output_bytes,
-                        &metric.output_packets,
-                        &"dlstat",
-                    ],
-                )
-                .await
-                .context("Failed to insert metrics")?;
+            let client = Arc::clone(&client);
+            let interface_id = interface.interface_id;
+            let timestamp = metric.timestamp;
+            let input_bytes = metric.input_bytes;
+            let input_packets = metric.input_packets;
+            let output_bytes = metric.output_bytes;
+            let output_packets = metric.output_packets;
+
+            execute_with_retry(move || {
+                let client = Arc::clone(&client);
+                Box::pin(async move {
+                    client
+                        .execute(
+                            "INSERT INTO netmetrics (
+                             interface_id, timestamp,
+                             input_bytes, input_packets, output_bytes, output_packets,
+                             collection_method
+                            ) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                            &[
+                                &interface_id,
+                                &timestamp,
+                                &input_bytes,
+                                &input_packets,
+                                &output_bytes,
+                                &output_packets,
+                                &"dlstat",
+                            ],
+                        )
+                        .await
+                        .context("Failed to insert metrics")
+                })
+            }, max_retries)
+            .await?;
         } else {
             println!("Unknown interface: {}", metric.interface_name);
         }
