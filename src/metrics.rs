@@ -1,7 +1,8 @@
 use crate::database;
 use crate::discovery;
 use crate::models::{NetworkInterface, NetworkMetric};
-use anyhow::{Context, Result};
+use crate::process_utils;
+use anyhow::{Context, Error, Result};
 use chrono::Utc;
 use log::{debug, error, info, trace, warn};
 use rand::random;
@@ -20,6 +21,9 @@ const MAX_BUFFER_AGE_MINUTES: i64 = 10; // Maximum age of buffered metrics
 const MAX_METRICS_PER_INTERFACE: usize = 100; // Maximum metrics to buffer per interface
 const MAX_BUFFER_SIZE: usize = 1000; // Total maximum buffer size across all interfaces
 const INTERFACE_DETECTION_THRESHOLD: usize = 5; // Minimum metrics to trigger forced detection
+const SUBPROCESS_RESTART_DELAY_MS: u64 = 1000; // Delay before restarting a failed subprocess
+const MAX_CONSECUTIVE_FAILURES: usize = 5; // Maximum number of consecutive failures before backing off
+const FAILURE_BACKOFF_MULTIPLIER: f64 = 2.0; // Multiplier for exponential backoff after failures
 
 // Define a struct for the metric message
 #[derive(Debug, Clone)]
@@ -90,6 +94,9 @@ pub async fn collect_metrics(
     // Create channels for communication
     let (rediscover_tx, mut rediscover_rx) = tokio::sync::mpsc::channel::<()>(1);
 
+    // Create a channel for metrics collection restart
+    let (_restart_tx, mut restart_rx) = mpsc::channel::<()>(1);
+
     // Trigger an immediate but non-blocking rediscovery to find interfaces in background
     trigger_initial_discovery(rediscover_tx.clone()).await;
 
@@ -128,6 +135,11 @@ pub async fn collect_metrics(
                     &mut unknown_metrics,
                     verbose
                 ).await?;
+            },
+
+            Some(_) = restart_rx.recv() => {
+                info!("Restarting metrics collection process");
+                metrics_rx = start_continuous_metrics_collection().await?;
             },
 
             else => break,
@@ -607,32 +619,139 @@ async fn store_metric(
 // Start a continuous metrics collection in the background
 pub async fn start_continuous_metrics_collection() -> Result<mpsc::Receiver<MetricMessage>> {
     // Create a channel for sending metrics from the background thread
-    let (tx, rx) = mpsc::channel::<MetricMessage>(100);
+    let (metrics_tx, metrics_rx) = mpsc::channel::<MetricMessage>(100);
+
+    // Create a channel for restart notifications
+    let (restart_tx, restart_rx) = mpsc::channel::<()>(1);
 
     // Spawn a dedicated thread for the blocking I/O operations
     info!("Starting metrics collection thread");
-    thread::spawn(move || {
-        let result = continuous_dlstat_collection(tx);
-        if let Err(e) = result {
-            error!("Metrics collection thread error: {}", e);
-        }
-    });
+    start_metrics_collector(metrics_tx.clone(), restart_rx);
 
-    Ok(rx)
+    Ok(metrics_rx)
 }
 
-// Function to run in the background thread that continuously reads from dlstat
-fn continuous_dlstat_collection(tx: mpsc::Sender<MetricMessage>) -> Result<()> {
+// Starts the metrics collector thread with restart capability
+fn start_metrics_collector(
+    metrics_tx: mpsc::Sender<MetricMessage>,
+    mut restart_rx: mpsc::Receiver<()>,
+) {
+    thread::spawn(move || {
+        let mut consecutive_failures = 0;
+        let mut delay = SUBPROCESS_RESTART_DELAY_MS;
+
+        loop {
+            // Run the metrics collection
+            match run_dlstat_collection(metrics_tx.clone()) {
+                Ok(_) => {
+                    // This shouldn't normally exit with Ok
+                    warn!("dlstat collector exited normally - this is unexpected");
+                    consecutive_failures += 1;
+                }
+                Err(e) => {
+                    error!("Metrics collection failed: {}", e);
+                    consecutive_failures += 1;
+                }
+            }
+
+            // Apply backoff if we're having consecutive failures
+            let current_delay = if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                let backoff_delay = (delay as f64 * FAILURE_BACKOFF_MULTIPLIER) as u64;
+                warn!(
+                    "Multiple consecutive failures ({}), increasing restart delay to {}ms",
+                    consecutive_failures, backoff_delay
+                );
+                backoff_delay.min(30000) // Cap at 30 seconds
+            } else {
+                delay
+            };
+
+            // Set up a sleep future
+            let sleep_future = tokio::time::sleep(Duration::from_millis(current_delay));
+            let sleep_handle = tokio::runtime::Handle::current().spawn(sleep_future);
+
+            // Check if we've been asked to restart immediately
+            match restart_rx.try_recv() {
+                Ok(_) => {
+                    // We've been asked to restart, abort the sleep
+                    sleep_handle.abort();
+                    info!("Received restart request, restarting metrics collection immediately");
+                    consecutive_failures = 0; // Reset failure count on manual restart
+                    delay = SUBPROCESS_RESTART_DELAY_MS; // Reset delay
+                    continue;
+                }
+                Err(mpsc::error::TryRecvError::Empty) => {
+                    // No restart message, continue with sleep
+                }
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    // Channel is closed, likely shutting down
+                    warn!("Restart channel disconnected, terminating metrics collector");
+                    break;
+                }
+            }
+
+            // Wait for the sleep to complete
+            match tokio::runtime::Handle::current().block_on(sleep_handle) {
+                Ok(_) => {
+                    info!(
+                        "Restarting metrics collection after delay of {}ms",
+                        current_delay
+                    );
+                }
+                Err(_) => {
+                    // Sleep was aborted, continue immediately
+                }
+            }
+        }
+    });
+}
+
+fn send_metrics_batch(tx: &mpsc::Sender<MetricMessage>, metrics: &[NetworkMetric]) -> Result<()> {
+    // Create a message with the collected metrics
+    let message = MetricMessage {
+        metrics: metrics.to_vec(),
+    };
+
+    trace!("Sending {} metrics from dlstat", message.metrics.len());
+
+    // Try to send the metrics to the channel
+    tx.blocking_send(message)
+        .map_err(|e| anyhow::anyhow!("Failed to send metrics: {}", e))?;
+
+    Ok(())
+}
+
+// Add a basic implementation of run_dlstat_collection
+fn run_dlstat_collection(tx: mpsc::Sender<MetricMessage>) -> Result<()> {
     // Start dlstat with interval mode
     debug!("Starting dlstat process with interval mode");
     let mut child = Command::new("/usr/sbin/dlstat")
         .args(&["-i", "1"]) // 1 second interval
         .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .context("Failed to run dlstat -i command")?;
 
-    let stdout = child.stdout.take().unwrap();
+    // Set up stdout reader
+    let stdout = child.stdout.take().ok_or_else(|| {
+        Error::msg("Failed to capture dlstat stdout")
+    })?;
     let reader = BufReader::new(stdout);
+
+    // Set up stderr reader for diagnostics
+    let stderr = child.stderr.take().ok_or_else(|| {
+        Error::msg("Failed to capture dlstat stderr")
+    })?;
+    let stderr_reader = BufReader::new(stderr);
+
+    // Spawn a thread to monitor stderr
+    thread::spawn(move || {
+        for line in stderr_reader.lines() {
+            if let Ok(line) = line {
+                warn!("dlstat error output: {}", line);
+            }
+        }
+    });
 
     let mut line_count = 0;
     let mut section_count = 0;
@@ -640,6 +759,23 @@ fn continuous_dlstat_collection(tx: mpsc::Sender<MetricMessage>) -> Result<()> {
     let mut is_collecting = false;
 
     info!("dlstat process started, reading data...");
+
+    // Spawn a thread to monitor the process status
+    let pid = child.id();
+    thread::spawn(move || {
+        match child.wait() {
+            Ok(status) => {
+                if status.success() {
+                    info!("dlstat process exited successfully with status: {}", status);
+                } else {
+                    error!("dlstat process exited with error status: {}", status);
+                }
+            },
+            Err(e) => {
+                error!("Error waiting for dlstat process: {}", e);
+            }
+        }
+    });
 
     // Read lines continuously
     for line in reader.lines() {
@@ -649,7 +785,9 @@ fn continuous_dlstat_collection(tx: mpsc::Sender<MetricMessage>) -> Result<()> {
         if line.contains("LINK") && line.contains("IPKTS") {
             // Process completed section if we have metrics
             if is_collecting && !current_metrics.is_empty() {
-                send_metrics_batch(&tx, &current_metrics)?;
+                if let Err(e) = send_metrics_batch(&tx, &current_metrics) {
+                    error!("Failed to send metrics batch: {}", e);
+                }
                 current_metrics = Vec::new();
             }
 
@@ -676,24 +814,9 @@ fn continuous_dlstat_collection(tx: mpsc::Sender<MetricMessage>) -> Result<()> {
         }
     }
 
-    // If we get here, the process terminated
-    warn!("dlstat process terminated");
-    Ok(())
-}
-
-fn send_metrics_batch(tx: &mpsc::Sender<MetricMessage>, metrics: &[NetworkMetric]) -> Result<()> {
-    // Create a message with the collected metrics
-    let message = MetricMessage {
-        metrics: metrics.to_vec(),
-    };
-
-    trace!("Sending {} metrics from dlstat", message.metrics.len());
-
-    // Try to send the metrics to the channel
-    tx.blocking_send(message)
-        .map_err(|e| anyhow::anyhow!("Failed to send metrics: {}", e))?;
-
-    Ok(())
+    // If we get here, the dlstat process has terminated (EOF on stdout)
+    warn!("dlstat process terminated (EOF on stdout)");
+    Err(Error::msg("dlstat process terminated unexpectedly"))
 }
 
 fn parse_dlstat_line(line: &str) -> Result<Option<NetworkMetric>> {

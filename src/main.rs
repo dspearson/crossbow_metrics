@@ -3,6 +3,7 @@ mod database;
 mod discovery;
 mod metrics;
 mod models;
+mod process_utils;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -37,6 +38,9 @@ async fn main() -> Result<()> {
 
     // Get max retries
     let max_retries = config.max_retries.unwrap_or(5);
+
+    // Setup signal handlers for clean shutdown
+    setup_signal_handlers();
 
     // Start the metrics collection loop
     info!("Starting metrics collection for host {}", hostname);
@@ -107,5 +111,32 @@ async fn connect_to_database(config: &AppConfig) -> Result<Arc<tokio_postgres::C
             error!("Aborting startup since database connection is required");
             Err(e)
         }
+    }
+}
+
+fn setup_signal_handlers() {
+    // Use tokio's signal handling to catch SIGINT and SIGTERM
+    #[cfg(unix)]
+    {
+        let sigint = async {
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+                .unwrap()
+                .recv()
+                .await;
+            info!("Received SIGINT, shutting down gracefully...");
+            std::process::exit(0);
+        };
+
+        let sigterm = async {
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .unwrap()
+                .recv()
+                .await;
+            info!("Received SIGTERM, shutting down gracefully...");
+            std::process::exit(0);
+        };
+
+        tokio::spawn(sigint);
+        tokio::spawn(sigterm);
     }
 }

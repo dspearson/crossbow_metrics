@@ -1,12 +1,16 @@
 use crate::database::execute_with_retry;
 use crate::models::NetworkInterface;
+use crate::process_utils;
+use nix::sys::signal::{self, Signal};
 use anyhow::{Context, Error, Result};
-use log::{debug, info, trace, warn};
+use log::{debug, error, info, trace, warn};
 use std::collections::HashMap;
-use std::process::Command;
 use std::sync::Arc;
 use tokio_postgres::Client;
 use uuid::Uuid;
+
+// Maximum time for a command to run before considering it hung
+const CMD_TIMEOUT_SECS: u64 = 15;
 
 // Function to get MAC address and MTU for an interface
 async fn get_interface_details(interface_name: &str) -> Result<(Option<String>, Option<i64>)> {
@@ -44,28 +48,26 @@ async fn try_get_mac_vnic(interface_name: &str) -> Result<Option<String>> {
         "Attempting to get MAC address for {} via dladm show-vnic",
         interface_name
     );
-    let vnic_output = Command::new("/usr/sbin/dladm")
-        .args(&["show-vnic", "-p", "-o", "macaddress", interface_name])
-        .output();
+    
+    let interface_name_clone = interface_name.to_string();
+    let vnic_output = tokio::task::spawn_blocking(move || {
+        execute_command_with_timeout(
+            "/usr/sbin/dladm",
+            &["show-vnic", "-p", "-o", "macaddress", &interface_name_clone]
+        )
+    }).await??;
 
-    if let Ok(output) = vnic_output {
-        if output.status.success() {
-            let mac_text = String::from_utf8_lossy(&output.stdout)
-                .to_string()
-                .trim()
-                .to_string();
-            if !mac_text.is_empty() {
-                let formatted_mac = format_mac_address(&mac_text)?;
-                if !formatted_mac.is_empty() {
-                    debug!(
-                        "Found MAC address for {} with VNIC method: {}",
-                        interface_name, &formatted_mac
-                    );
-                    return Ok(Some(formatted_mac));
-                }
+    if let Some(output) = vnic_output {
+        let mac_text = output.trim().to_string();
+        if !mac_text.is_empty() {
+            let formatted_mac = format_mac_address(&mac_text)?;
+            if !formatted_mac.is_empty() {
+                debug!(
+                    "Found MAC address for {} with VNIC method: {}",
+                    interface_name, &formatted_mac
+                );
+                return Ok(Some(formatted_mac));
             }
-        } else {
-            trace!("dladm show-vnic command failed or returned no output");
         }
     }
 
@@ -77,28 +79,27 @@ async fn try_get_mac_phys(interface_name: &str) -> Result<Option<String>> {
         "Attempting to get MAC address for {} via dladm show-phys",
         interface_name
     );
-    let mac_output = Command::new("/usr/sbin/dladm")
-        .args(&["show-phys", "-p", "-o", "macaddress", interface_name])
-        .output();
 
-    if let Ok(output) = mac_output {
-        if output.status.success() {
-            let mac_text = String::from_utf8_lossy(&output.stdout)
-                .to_string()
-                .trim()
-                .to_string();
-            if !mac_text.is_empty() {
-                let formatted_mac = format_mac_address(&mac_text)?;
-                if !formatted_mac.is_empty() {
-                    debug!(
-                        "Found MAC address for {}: {}",
-                        interface_name, &formatted_mac
-                    );
-                    return Ok(Some(formatted_mac));
-                }
+    let interface_name_clone = interface_name.to_string();
+    let mac_output = tokio::task::spawn_blocking(move || {
+        execute_command_with_timeout(
+            "/usr/sbin/dladm",
+            &["show-phys", "-p", "-o", "macaddress", &interface_name_clone],
+        )
+    })
+    .await??;
+
+    if let Some(output) = mac_output {
+        let mac_text = output.trim().to_string();
+        if !mac_text.is_empty() {
+            let formatted_mac = format_mac_address(&mac_text)?;
+            if !formatted_mac.is_empty() {
+                debug!(
+                    "Found MAC address for {}: {}",
+                    interface_name, &formatted_mac
+                );
+                return Ok(Some(formatted_mac));
             }
-        } else {
-            trace!("dladm show-phys command failed or returned no output");
         }
     }
 
@@ -110,28 +111,27 @@ async fn try_get_mac_link(interface_name: &str) -> Result<Option<String>> {
         "Attempting to get MAC address for {} via dladm show-link",
         interface_name
     );
-    let alt_mac_output = Command::new("/usr/sbin/dladm")
-        .args(&["show-link", "-p", "-o", "macaddress", interface_name])
-        .output();
 
-    if let Ok(output) = alt_mac_output {
-        if output.status.success() {
-            let mac_text = String::from_utf8_lossy(&output.stdout)
-                .to_string()
-                .trim()
-                .to_string();
-            if !mac_text.is_empty() {
-                let formatted_mac = format_mac_address(&mac_text)?;
-                if !formatted_mac.is_empty() {
-                    debug!(
-                        "Found MAC address for {} with alternative method: {}",
-                        interface_name, &formatted_mac
-                    );
-                    return Ok(Some(formatted_mac));
-                }
+    let interface_name_clone = interface_name.to_string();
+    let alt_mac_output = tokio::task::spawn_blocking(move || {
+        execute_command_with_timeout(
+            "/usr/sbin/dladm",
+            &["show-link", "-p", "-o", "macaddress", &interface_name_clone],
+        )
+    })
+    .await??;
+
+    if let Some(output) = alt_mac_output {
+        let mac_text = output.trim().to_string();
+        if !mac_text.is_empty() {
+            let formatted_mac = format_mac_address(&mac_text)?;
+            if !formatted_mac.is_empty() {
+                debug!(
+                    "Found MAC address for {} with alternative method: {}",
+                    interface_name, &formatted_mac
+                );
+                return Ok(Some(formatted_mac));
             }
-        } else {
-            trace!("dladm show-link command failed or returned no output");
         }
     }
 
@@ -140,31 +140,238 @@ async fn try_get_mac_link(interface_name: &str) -> Result<Option<String>> {
 
 async fn get_interface_mtu(interface_name: &str) -> Result<Option<i64>> {
     trace!("Attempting to get MTU for {}", interface_name);
-    let mtu_output = Command::new("/usr/sbin/dladm")
-        .args(&["show-link", "-p", "-o", "mtu", interface_name])
-        .output();
 
-    if let Ok(output) = mtu_output {
-        if output.status.success() {
-            let mtu_text = String::from_utf8_lossy(&output.stdout)
-                .to_string()
-                .trim()
-                .to_string();
-            if !mtu_text.is_empty() {
-                if let Ok(mtu_value) = mtu_text.parse::<i64>() {
-                    if mtu_value > 0 {
-                        debug!("Found MTU for {}: {}", interface_name, mtu_value);
-                        return Ok(Some(mtu_value));
-                    }
+    let interface_name_clone = interface_name.to_string();
+    let mtu_output = tokio::task::spawn_blocking(move || {
+        execute_command_with_timeout(
+            "/usr/sbin/dladm",
+            &["show-link", "-p", "-o", "mtu", &interface_name_clone],
+        )
+    })
+    .await??;
+
+    if let Some(output) = mtu_output {
+        let mtu_text = output.trim().to_string();
+        if !mtu_text.is_empty() {
+            if let Ok(mtu_value) = mtu_text.parse::<i64>() {
+                if mtu_value > 0 {
+                    debug!("Found MTU for {}: {}", interface_name, mtu_value);
+                    return Ok(Some(mtu_value));
                 }
             }
-        } else {
-            trace!("dladm show-link command for MTU failed or returned no output");
         }
     }
 
     debug!("Could not determine MTU for {}", interface_name);
     Ok(None)
+}
+
+async fn update_existing_interface(
+    client: &Arc<Client>,
+    interface_id: Uuid,
+    interface_name: &str,
+    interface_type: &str,
+    parent_interface: &Option<String>,
+    mac_address: &Option<String>,
+    mtu: Option<i64>,
+    zone_id: Option<Uuid>,
+    max_retries: usize,
+) -> Result<()> {
+    // Check current MAC address to see if it changed
+    let current_mac = get_current_mac_address(client, interface_id, max_retries).await?;
+
+    // Check if MAC address has changed
+    let mac_changed = is_mac_address_changed(&current_mac, mac_address);
+
+    if mac_changed {
+        handle_mac_address_change(client, interface_id, &current_mac, mac_address, max_retries)
+            .await?;
+    }
+
+    // Update interface details
+    update_interface_record(
+        client,
+        interface_id,
+        interface_type,
+        parent_interface,
+        mac_address,
+        mtu,
+        max_retries,
+    )
+    .await?;
+
+    // Format zone information
+    let zone_desc = match &zone_id {
+        Some(id) => format!("zone ID: {}", id),
+        None => "global zone".to_string(),
+    };
+
+    // Format MAC address for logging
+    let mac_display = match mac_address {
+        Some(mac) => format!("MAC: {}", mac),
+        None => "no MAC".to_string(),
+    };
+
+    // Format MTU for logging
+    let mtu_display = match mtu {
+        Some(mtu_value) => format!("MTU: {}", mtu_value),
+        None => "default MTU".to_string(),
+    };
+
+    if mac_changed {
+        // Format the previous MAC for better logging
+        let old_mac_display = match &current_mac {
+            Some(mac) => format!("{}", mac),
+            None => "none".to_string(),
+        };
+
+        // Format the new MAC
+        let new_mac_display = match mac_address {
+            Some(mac) => format!("{}", mac),
+            None => "none".to_string(),
+        };
+
+        info!(
+            "Updated interface record with MAC change: {} - {} ({}, MAC: {} → {}, {})",
+            interface_name, interface_id, zone_desc, old_mac_display, new_mac_display, mtu_display
+        );
+    } else {
+        trace!(
+            "Updated existing interface record: {} - {} ({}, {}, {})",
+            interface_name, interface_id, zone_desc, mac_display, mtu_display
+        );
+    }
+
+    Ok(())
+}
+
+fn log_detailed_interface_info(
+    interfaces: &HashMap<String, NetworkInterface>,
+    zones: &HashMap<String, Uuid>,
+) {
+    debug!("Interface details:");
+    for (name, interface) in interfaces {
+        // Format zone information
+        let zone_info = match &interface.zone_id {
+            Some(id) => {
+                let zone_name = zones
+                    .iter()
+                    .find(|&(_, zone_id)| *zone_id == *id)
+                    .map(|(name, _)| name.clone())
+                    .unwrap_or_else(|| "unknown".to_string());
+                format!("zone: {}", zone_name)
+            }
+            None => "global zone".to_string(),
+        };
+
+        // Format parent information
+        let parent_display = match &interface.parent_interface {
+            Some(parent) => format!("parent: {}", parent),
+            None => "no parent".to_string(),
+        };
+
+        debug!(
+            "Interface: {} (type: {}, {}, {})",
+            name, interface.interface_type, zone_info, parent_display
+        );
+    }
+}
+
+// Execute a command with a timeout to prevent hanging
+fn execute_command_with_timeout(command: &str, args: &[&str]) -> Result<Option<String>> {
+    // Create the command
+    let mut cmd = Command::new(command);
+    cmd.args(args);
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    
+    debug!("Executing command: {} {}", command, args.join(" "));
+    
+    // Start the command
+    let mut child = cmd.spawn().context(format!("Failed to execute command: {}", command))?;
+    
+    // Set up a timeout for the command
+    let timeout = std::time::Duration::from_secs(CMD_TIMEOUT_SECS);
+    
+    // Use a separate thread to wait for the command to complete
+    let child_id = child.id();
+    let timeout_handle = std::thread::spawn(move || {
+        let start = std::time::Instant::now();
+        
+        while start.elapsed() < timeout {
+            // Check if the process has exited
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    // Process has exited
+                    if status.success() {
+                        // Read stdout if successful
+                        if let Some(stdout) = child.stdout.take() {
+                            let mut reader = BufReader::new(stdout);
+                            let mut output = String::new();
+                            if reader.read_to_string(&mut output).is_ok() {
+                                return Ok(Some(output));
+                            }
+                        }
+                        // If we couldn't read stdout but exit code was 0, return empty string
+                        return Ok(Some(String::new()));
+                    } else {
+                        // Process failed
+                        let mut stderr = String::new();
+                        if let Some(stderr_handle) = child.stderr.take() {
+                            let mut reader = BufReader::new(stderr_handle);
+                            let _ = reader.read_to_string(&mut stderr);
+                        }
+                        return Err(anyhow::anyhow!(
+                            "Command failed with status {}: {}",
+                            status, stderr.trim()
+                        ));
+                    }
+                },
+                Ok(None) => {
+                    // Process still running, sleep a bit and try again
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                },
+                Err(e) => {
+                    // Error checking process status
+                    return Err(anyhow::anyhow!("Error checking process status: {}", e));
+                }
+            }
+        }
+        
+        // If we get here, the process has timed out
+        warn!("Command timed out after {} seconds: {} {}", 
+              timeout.as_secs(), command, args.join(" "));
+        
+        // Try to kill the process
+        match nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(child_id as i32),
+            nix::sys::signal::Signal::SIGTERM
+        ) {
+            Ok(_) => debug!("Successfully sent SIGTERM to process {}", child_id),
+            Err(e) => warn!("Failed to terminate process {}: {}", child_id, e),
+        }
+        
+        // Give it a moment to terminate
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        
+        // If still alive, force kill
+        if child.try_wait().is_ok() {
+            match nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(child_id as i32),
+                nix::sys::signal::Signal::SIGKILL
+            ) {
+                Ok(_) => debug!("Successfully sent SIGKILL to process {}", child_id),
+                Err(e) => warn!("Failed to kill process {}: {}", child_id, e),
+            }
+        }
+        
+        Ok(None) // Return None to indicate timeout
+    });
+    
+    timeout_handle.join().unwrap_or_else(|_| {
+        warn!("Timeout thread panicked for command: {} {}", command, args.join(" "));
+        Ok(None)
+    })
 }
 
 // Helper function to properly format MAC addresses from OmniOS output
@@ -291,13 +498,17 @@ pub async fn discover_zones(
 }
 
 async fn get_zone_list() -> Result<String> {
-    let output = Command::new("/usr/sbin/zoneadm")
-        .arg("list")
-        .arg("-p")
-        .output()
-        .context("Failed to run zoneadm command")?;
+    let output = tokio::task::spawn_blocking(|| {
+        execute_command_with_timeout("/usr/sbin/zoneadm", &["list", "-p"])
+    })
+    .await??;
 
-    String::from_utf8(output.stdout).context("Invalid UTF-8 in zoneadm output")
+    match output {
+        Some(output) => Ok(output),
+        None => Err(anyhow::anyhow!(
+            "Failed to get zone list - command timed out or was terminated"
+        )),
+    }
 }
 
 async fn ensure_zone_exists(
@@ -417,22 +628,36 @@ pub async fn discover_interfaces(
 async fn get_interface_information() -> Result<(String, HashMap<String, String>)> {
     // Get all datalinks (including physical, etherstub, vnic)
     debug!("Retrieving datalink information from system");
-    let output = Command::new("/usr/sbin/dladm")
-        .args(&["show-link", "-p", "-o", "link,class"])
-        .output()
-        .context("Failed to run dladm show-link command")?;
 
-    let link_output = String::from_utf8(output.stdout).context("Invalid UTF-8 in dladm output")?;
+    let link_output = tokio::task::spawn_blocking(|| {
+        execute_command_with_timeout("/usr/sbin/dladm", &["show-link", "-p", "-o", "link,class"])
+    })
+    .await??;
+
+    let link_output = match link_output {
+        Some(output) => output,
+        None => {
+            return Err(anyhow::anyhow!(
+                "Failed to get interface information - command timed out or was terminated"
+            ));
+        }
+    };
 
     // Get VNIC parent relationships
     debug!("Retrieving VNIC parent relationships");
-    let vnic_output = Command::new("/usr/sbin/dladm")
-        .args(&["show-vnic", "-p", "-o", "link,over"])
-        .output()
-        .context("Failed to run dladm show-vnic command")?;
+    let vnic_output = tokio::task::spawn_blocking(|| {
+        execute_command_with_timeout("/usr/sbin/dladm", &["show-vnic", "-p", "-o", "link,over"])
+    })
+    .await??;
 
-    let vnic_output =
-        String::from_utf8(vnic_output.stdout).context("Invalid UTF-8 in dladm vnic output")?;
+    let vnic_output = match vnic_output {
+        Some(output) => output,
+        None => {
+            return Err(anyhow::anyhow!(
+                "Failed to get VNIC information - command timed out or was terminated"
+            ));
+        }
+    };
 
     // Build a mapping of VNICs to their parent interfaces
     let mut vnic_parents = HashMap::new();
@@ -666,36 +891,46 @@ async fn build_map_using_zonecfg(
         debug!("Checking zone {} for net resources", zone_name);
 
         // Get network interfaces defined in the zone
-        let zonecfg_output = Command::new("/usr/sbin/zonecfg")
-            .args(&["-z", zone_name, "info", "net"])
-            .output();
+        let zone_name_clone = zone_name.clone();
+        let zonecfg_output = tokio::task::spawn_blocking(move || {
+            execute_command_with_timeout(
+                "/usr/sbin/zonecfg",
+                &["-z", &zone_name_clone, "info", "net"],
+            )
+        })
+        .await??;
 
-        if let Ok(output) = zonecfg_output {
-            let zonecfg_text = String::from_utf8_lossy(&output.stdout).to_string();
+        let zonecfg_output = match zonecfg_output {
+            Some(output) => output,
+            None => {
+                warn!(
+                    "Timeout retrieving network configuration for zone {}",
+                    zone_name
+                );
+                continue;
+            }
+        };
 
-            if verbose {
-                trace!("zonecfg output for zone {}:", zone_name);
-                for line in zonecfg_text.lines() {
-                    trace!("  {}", line);
+        if verbose {
+            trace!("zonecfg output for zone {}:", zone_name);
+            for line in zonecfg_output.lines() {
+                trace!("  {}", line);
+            }
+        }
+
+        // Parse the output to find the physical interface name
+        for line in zonecfg_output.lines() {
+            let line = line.trim();
+
+            if line.starts_with("physical:") {
+                // Extract interface name after "physical:"
+                if let Some(iface_name) = line.split(':').nth(1) {
+                    let interface_name = iface_name.trim().to_string();
+
+                    info!("Found interface {} in zone {}", interface_name, zone_name);
+                    interface_map.insert(interface_name, *zone_uuid);
                 }
             }
-
-            // Parse the output to find the physical interface name
-            for line in zonecfg_text.lines() {
-                let line = line.trim();
-
-                if line.starts_with("physical:") {
-                    // Extract interface name after "physical:"
-                    if let Some(iface_name) = line.split(':').nth(1) {
-                        let interface_name = iface_name.trim().to_string();
-
-                        info!("Found interface {} in zone {}", interface_name, zone_name);
-                        interface_map.insert(interface_name, *zone_uuid);
-                    }
-                }
-            }
-        } else if let Err(e) = &zonecfg_output {
-            warn!("Error running zonecfg for {}: {}", zone_name, e);
         }
     }
 
@@ -710,34 +945,42 @@ async fn build_map_using_dladm(
 
     info!("No mappings found with zonecfg, trying dladm show-link -Z");
 
-    let dladm_output = Command::new("/usr/sbin/dladm")
-        .args(&["show-link", "-Z", "-p", "-o", "link,zone"])
-        .output();
+    let dladm_output = tokio::task::spawn_blocking(|| {
+        execute_command_with_timeout(
+            "/usr/sbin/dladm",
+            &["show-link", "-Z", "-p", "-o", "link,zone"],
+        )
+    })
+    .await??;
 
-    if let Ok(output) = dladm_output {
-        let link_text = String::from_utf8_lossy(&output.stdout).to_string();
-
-        if verbose {
-            trace!("dladm show-link -Z output:");
-            for line in link_text.lines() {
-                trace!("  {}", line);
-            }
+    let link_text = match dladm_output {
+        Some(output) => output,
+        None => {
+            warn!("Timeout retrieving zone-link mappings with dladm");
+            return Ok(zone_interface_map);
         }
+    };
 
+    if verbose {
+        trace!("dladm show-link -Z output:");
         for line in link_text.lines() {
-            let fields: Vec<&str> = line.split(':').collect();
-            if fields.len() >= 2 {
-                let interface_name = fields[0].trim();
-                let zone_name = fields[1].trim();
+            trace!("  {}", line);
+        }
+    }
 
-                if !zone_name.is_empty() && zone_name != "global" {
-                    if let Some(zone_uuid) = zones.get(zone_name) {
-                        info!(
-                            "Associating interface {} with zone {}",
-                            interface_name, zone_name
-                        );
-                        zone_interface_map.insert(interface_name.to_string(), *zone_uuid);
-                    }
+    for line in link_text.lines() {
+        let fields: Vec<&str> = line.split(':').collect();
+        if fields.len() >= 2 {
+            let interface_name = fields[0].trim();
+            let zone_name = fields[1].trim();
+
+            if !zone_name.is_empty() && zone_name != "global" {
+                if let Some(zone_uuid) = zones.get(zone_name) {
+                    info!(
+                        "Associating interface {} with zone {}",
+                        interface_name, zone_name
+                    );
+                    zone_interface_map.insert(interface_name.to_string(), *zone_uuid);
                 }
             }
         }
@@ -901,584 +1144,4 @@ async fn is_new_interface(
         max_retries,
     )
     .await
-}
-
-async fn create_new_interface(
-    client: &Arc<Client>,
-    interface_id: Uuid,
-    host_id: Uuid,
-    zone_id: Option<Uuid>,
-    interface_name: &str,
-    interface_type: &str,
-    parent_interface: &Option<String>,
-    mac_address: &Option<String>,
-    mtu: Option<i64>,
-    max_retries: usize,
-) -> Result<()> {
-    // Create new interface
-    let client_clone = Arc::clone(client);
-    let interface_id_clone = interface_id;
-    let host_id_clone = host_id;
-    let zone_id_clone = zone_id;
-    let interface_name_clone = interface_name.to_string();
-    let interface_type_clone = interface_type.to_string();
-    let parent_interface_clone = parent_interface.clone();
-    let mac_address_clone = mac_address.clone();
-    let mtu_clone = mtu;
-
-    execute_with_retry(
-        move || {
-            let client = Arc::clone(&client_clone);
-            let interface_id = interface_id_clone;
-            let host_id = host_id_clone;
-            let zone_id = zone_id_clone;
-            let interface_name = interface_name_clone.clone();
-            let interface_type = interface_type_clone.clone();
-            let parent_interface = parent_interface_clone.clone();
-            let mac_address = mac_address_clone.clone();
-            let mtu = mtu_clone;
-
-            Box::pin(async move {
-                client
-                    .execute(
-                        "INSERT INTO interfaces (
-                 interface_id, host_id, zone_id, interface_name,
-                 interface_type, parent_interface, mac_address, mtu,
-                 is_active, created_at
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true, CURRENT_TIMESTAMP)",
-                        &[
-                            &interface_id,
-                            &host_id,
-                            &zone_id,
-                            &interface_name,
-                            &interface_type,
-                            &parent_interface,
-                            &mac_address,
-                            &mtu,
-                        ],
-                    )
-                    .await
-                    .context("Failed to insert interface")
-            })
-        },
-        max_retries,
-    )
-    .await?;
-
-    // If MAC address is provided, create initial history record
-    if let Some(mac) = mac_address {
-        create_initial_mac_history(client, interface_id, mac, max_retries).await?;
-    }
-
-    // Format zone information
-    let zone_desc = match &zone_id {
-        Some(id) => format!("zone ID: {}", id),
-        None => "global zone".to_string(),
-    };
-
-    // Format MAC address for logging
-    let mac_display = match mac_address {
-        Some(mac) => format!("MAC: {}", mac),
-        None => "no MAC".to_string(),
-    };
-
-    // Format MTU for logging
-    let mtu_display = match mtu {
-        Some(mtu_value) => format!("MTU: {}", mtu_value),
-        None => "default MTU".to_string(),
-    };
-
-    info!(
-        "Created new interface record: {} - {} ({}, {}, {})",
-        interface_name, interface_id, zone_desc, mac_display, mtu_display
-    );
-
-    Ok(())
-}
-
-async fn update_existing_interface(
-    client: &Arc<Client>,
-    interface_id: Uuid,
-    interface_name: &str,
-    interface_type: &str,
-    parent_interface: &Option<String>,
-    mac_address: &Option<String>,
-    mtu: Option<i64>,
-    zone_id: Option<Uuid>,
-    max_retries: usize,
-) -> Result<()> {
-    // Check current MAC address to see if it changed
-    let current_mac = get_current_mac_address(client, interface_id, max_retries).await?;
-
-    // Check if MAC address has changed
-    let mac_changed = is_mac_address_changed(&current_mac, mac_address);
-
-    if mac_changed {
-        handle_mac_address_change(client, interface_id, &current_mac, mac_address, max_retries)
-            .await?;
-    }
-
-    // Update interface details
-    update_interface_record(
-        client,
-        interface_id,
-        interface_type,
-        parent_interface,
-        mac_address,
-        mtu,
-        max_retries,
-    )
-    .await?;
-
-    // Format zone information
-    let zone_desc = match &zone_id {
-        Some(id) => format!("zone ID: {}", id),
-        None => "global zone".to_string(),
-    };
-
-    // Format MAC address for logging
-    let mac_display = match mac_address {
-        Some(mac) => format!("MAC: {}", mac),
-        None => "no MAC".to_string(),
-    };
-
-    // Format MTU for logging
-    let mtu_display = match mtu {
-        Some(mtu_value) => format!("MTU: {}", mtu_value),
-        None => "default MTU".to_string(),
-    };
-
-    if mac_changed {
-        // Format the previous MAC for better logging
-        let old_mac_display = match &current_mac {
-            Some(mac) => format!("{}", mac),
-            None => "none".to_string(),
-        };
-
-        // Format the new MAC
-        let new_mac_display = match mac_address {
-            Some(mac) => format!("{}", mac),
-            None => "none".to_string(),
-        };
-
-        info!(
-            "Updated interface record with MAC change: {} - {} ({}, MAC: {} → {}, {})",
-            interface_name, interface_id, zone_desc, old_mac_display, new_mac_display, mtu_display
-        );
-    } else {
-        trace!(
-            "Updated existing interface record: {} - {} ({}, {}, {})",
-            interface_name, interface_id, zone_desc, mac_display, mtu_display
-        );
-    }
-
-    Ok(())
-}
-
-pub async fn force_interface_detection(
-    client: Arc<Client>,
-    host_id: Uuid,
-    interface_name: &str,
-    max_retries: usize,
-) -> Result<NetworkInterface> {
-    debug!(
-        "Attempting to force detection of interface: {}",
-        interface_name
-    );
-
-    let (interface_type, parent_interface) =
-        determine_interface_type_and_parent(interface_name).await?;
-
-    // Create the interface record
-    let interface_id = ensure_interface_exists(
-        Arc::clone(&client),
-        host_id,
-        None, // Default to global zone
-        interface_name.to_string(),
-        interface_type.clone(),
-        parent_interface.clone(),
-        max_retries,
-    )
-    .await?;
-
-    let interface = NetworkInterface {
-        interface_id,
-        host_id,
-        zone_id: None,
-        interface_name: interface_name.to_string(),
-        interface_type,
-        parent_interface,
-    };
-
-    // Format parent information for logging
-    let parent_display = match &interface.parent_interface {
-        Some(parent) => format!(", parent: {}", parent),
-        None => String::new(),
-    };
-
-    info!(
-        "Created interface record for interface: {} (type: {}{})",
-        interface_name, interface.interface_type, parent_display
-    );
-
-    Ok(interface)
-}
-
-fn log_detailed_interface_info(
-    interfaces: &HashMap<String, NetworkInterface>,
-    zones: &HashMap<String, Uuid>,
-) {
-    debug!("Interface details:");
-    for (name, interface) in interfaces {
-        // Format zone information
-        let zone_info = match &interface.zone_id {
-            Some(id) => {
-                let zone_name = zones
-                    .iter()
-                    .find(|&(_, zone_id)| *zone_id == *id)
-                    .map(|(name, _)| name.clone())
-                    .unwrap_or_else(|| "unknown".to_string());
-                format!("zone: {}", zone_name)
-            }
-            None => "global zone".to_string(),
-        };
-
-        // Format parent information
-        let parent_display = match &interface.parent_interface {
-            Some(parent) => format!("parent: {}", parent),
-            None => "no parent".to_string(),
-        };
-
-        debug!(
-            "Interface: {} (type: {}, {}, {})",
-            name, interface.interface_type, zone_info, parent_display
-        );
-    }
-}
-
-async fn handle_mac_address_change(
-    client: &Arc<Client>,
-    interface_id: Uuid,
-    current_mac: &Option<String>,
-    new_mac: &Option<String>,
-    max_retries: usize,
-) -> Result<()> {
-    // Format MAC addresses for logging
-    let old_mac_display = match current_mac {
-        Some(mac) => mac.clone(),
-        None => "none".to_string(),
-    };
-
-    let new_mac_display = match new_mac {
-        Some(mac) => mac.clone(),
-        None => "none".to_string(),
-    };
-
-    debug!(
-        "MAC address change detected for interface {}: {} → {}",
-        interface_id, old_mac_display, new_mac_display
-    );
-
-    // 1. Close previous MAC history record if exists
-    if let Some(mac) = current_mac {
-        close_previous_mac_history(client, interface_id, mac, max_retries).await?;
-    }
-
-    // 2. Create new MAC history record
-    if let Some(new_mac) = new_mac {
-        create_new_mac_history(client, interface_id, new_mac, max_retries).await?;
-    }
-
-    Ok(())
-}
-
-async fn create_initial_mac_history(
-    client: &Arc<Client>,
-    interface_id: Uuid,
-    mac: &str,
-    max_retries: usize,
-) -> Result<()> {
-    let client_clone = Arc::clone(client);
-    let interface_id_clone = interface_id;
-    let mac_clone = mac.to_string();
-
-    execute_with_retry(
-        move || {
-            let client = Arc::clone(&client_clone);
-            let interface_id = interface_id_clone;
-            let mac = mac_clone.clone();
-
-            Box::pin(async move {
-                client
-                    .execute(
-                        "INSERT INTO mac_address_history
-                 (interface_id, mac_address, effective_from, change_reason)
-                 VALUES ($1, $2, CURRENT_TIMESTAMP, $3)",
-                        &[&interface_id, &mac, &"Initial discovery"],
-                    )
-                    .await
-                    .context("Failed to insert initial MAC history record")
-            })
-        },
-        max_retries,
-    )
-    .await?;
-
-    Ok(())
-}
-
-async fn get_current_mac_address(
-    client: &Arc<Client>,
-    interface_id: Uuid,
-    max_retries: usize,
-) -> Result<Option<String>> {
-    let client_clone = Arc::clone(client);
-    let interface_id_clone = interface_id;
-
-    execute_with_retry(
-        move || {
-            let client = Arc::clone(&client_clone);
-            let interface_id = interface_id_clone;
-
-            Box::pin(async move {
-                let row = client
-                    .query_opt(
-                        "SELECT mac_address FROM interfaces WHERE interface_id = $1",
-                        &[&interface_id],
-                    )
-                    .await
-                    .context("Failed to query current MAC address")?;
-
-                // Fix: Properly handle NULL values in the database column
-                let current_mac: Option<Option<String>> = row.map(|r| r.get(0));
-                // Fix: Extract the inner Option correctly
-                let result = current_mac.flatten();
-
-                Ok::<_, Error>(result)
-            })
-        },
-        max_retries,
-    )
-    .await
-}
-
-fn is_mac_address_changed(current_mac: &Option<String>, new_mac: &Option<String>) -> bool {
-    match (current_mac, new_mac) {
-        (Some(current), Some(new)) => current != new,
-        (None, Some(_)) => true,
-        _ => false,
-    }
-}
-
-async fn close_previous_mac_history(
-    client: &Arc<Client>,
-    interface_id: Uuid,
-    mac: &str,
-    max_retries: usize,
-) -> Result<()> {
-    let client_clone = Arc::clone(client);
-    let interface_id_clone = interface_id;
-    let mac_clone = mac.to_string();
-
-    execute_with_retry(
-        move || {
-            let client = Arc::clone(&client_clone);
-            let interface_id = interface_id_clone;
-            let mac = mac_clone.clone();
-
-            Box::pin(async move {
-                client
-                    .execute(
-                        "UPDATE mac_address_history
-                 SET effective_to = CURRENT_TIMESTAMP
-                 WHERE interface_id = $1 AND mac_address = $2 AND effective_to IS NULL",
-                        &[&interface_id, &mac],
-                    )
-                    .await
-                    .context("Failed to close previous MAC history record")
-            })
-        },
-        max_retries,
-    )
-    .await?;
-
-    Ok(())
-}
-
-async fn create_new_mac_history(
-    client: &Arc<Client>,
-    interface_id: Uuid,
-    new_mac: &str,
-    max_retries: usize,
-) -> Result<()> {
-    let client_clone = Arc::clone(client);
-    let interface_id_clone = interface_id;
-    let new_mac_clone = new_mac.to_string();
-
-    execute_with_retry(
-        move || {
-            let client = Arc::clone(&client_clone);
-            let interface_id = interface_id_clone;
-            let new_mac = new_mac_clone.clone();
-
-            Box::pin(async move {
-                client
-                    .execute(
-                        "INSERT INTO mac_address_history
-                 (interface_id, mac_address, effective_from, change_reason)
-                 VALUES ($1, $2, CURRENT_TIMESTAMP, $3)",
-                        &[&interface_id, &new_mac, &"Discovery update"],
-                    )
-                    .await
-                    .context("Failed to insert new MAC history record")
-            })
-        },
-        max_retries,
-    )
-    .await?;
-
-    Ok(())
-}
-
-async fn update_interface_record(
-    client: &Arc<Client>,
-    interface_id: Uuid,
-    interface_type: &str,
-    parent_interface: &Option<String>,
-    mac_address: &Option<String>,
-    mtu: Option<i64>,
-    max_retries: usize,
-) -> Result<()> {
-    let client_clone = Arc::clone(client);
-    let interface_id_clone = interface_id;
-    let interface_type_clone = interface_type.to_string();
-    let parent_interface_clone = parent_interface.clone();
-    let mac_address_clone = mac_address.clone();
-    let mtu_clone = mtu;
-
-    execute_with_retry(
-        move || {
-            let client = Arc::clone(&client_clone);
-            let interface_id = interface_id_clone;
-            let interface_type = interface_type_clone.clone();
-            let parent_interface = parent_interface_clone.clone();
-            let mac_address = mac_address_clone.clone();
-            let mtu = mtu_clone;
-
-            Box::pin(async move {
-                client
-                    .execute(
-                        "UPDATE interfaces SET
-                 interface_type = $1,
-                 parent_interface = $2,
-                 mac_address = $3,
-                 mtu = $4,
-                 is_active = true
-                 WHERE interface_id = $5",
-                        &[
-                            &interface_type,
-                            &parent_interface,
-                            &mac_address,
-                            &mtu,
-                            &interface_id,
-                        ],
-                    )
-                    .await
-                    .context("Failed to update interface")
-            })
-        },
-        max_retries,
-    )
-    .await?;
-
-    Ok(())
-}
-
-pub async fn determine_interface_type_and_parent(
-    interface_name: &str,
-) -> Result<(String, Option<String>)> {
-    // Try to get accurate interface type by querying dladm directly for this specific interface
-    let output = Command::new("/usr/sbin/dladm")
-        .args(&["show-link", "-p", "-o", "link,class", interface_name])
-        .output()
-        .context(format!(
-            "Failed to run dladm show-link for {}",
-            interface_name
-        ))?;
-
-    let link_output = String::from_utf8(output.stdout).context("Invalid UTF-8 in dladm output")?;
-
-    // Default values
-    let mut interface_type = "dev".to_string(); // Default type
-    let mut parent_interface = None;
-
-    // Parse dladm output to get actual interface type
-    for line in link_output.lines() {
-        let fields: Vec<&str> = line.split(':').collect();
-        if fields.len() >= 2 && fields[0] == interface_name {
-            interface_type = fields[1].to_string();
-            break;
-        }
-    }
-
-    // If it's a VNIC, get the parent interface
-    if interface_type == "vnic" {
-        parent_interface = get_vnic_parent(interface_name).await?;
-    }
-
-    // If dladm didn't find the interface, fall back to guessing based on naming conventions
-    if link_output.trim().is_empty() {
-        debug!(
-            "Interface {} not found in dladm, using heuristics to determine type",
-            interface_name
-        );
-        interface_type = guess_interface_type(interface_name);
-    }
-
-    Ok((interface_type, parent_interface))
-}
-
-pub async fn get_vnic_parent(interface_name: &str) -> Result<Option<String>> {
-    let vnic_output = Command::new("/usr/sbin/dladm")
-        .args(&["show-vnic", "-p", "-o", "link,over", interface_name])
-        .output()
-        .context(format!(
-            "Failed to run dladm show-vnic for {}",
-            interface_name
-        ))?;
-
-    let vnic_text =
-        String::from_utf8(vnic_output.stdout).context("Invalid UTF-8 in dladm vnic output")?;
-
-    for line in vnic_text.lines() {
-        let fields: Vec<&str> = line.split(':').collect();
-        if fields.len() >= 2 && fields[0] == interface_name {
-            return Ok(Some(fields[1].to_string()));
-        }
-    }
-
-    Ok(None)
-}
-
-fn guess_interface_type(interface_name: &str) -> String {
-    if interface_name.starts_with("igb")
-        || interface_name.starts_with("e1000g")
-        || interface_name.starts_with("bge")
-        || interface_name.starts_with("ixgbe")
-    {
-        "phys".to_string() // Physical device
-    } else if interface_name.ends_with("stub") || interface_name.contains("stub") {
-        "etherstub".to_string()
-    } else if interface_name.ends_with("0")
-        && !interface_name.contains("gw")
-        && !interface_name.starts_with("igb")
-    {
-        "bridge".to_string() // Likely a bridge (ends with 0)
-    } else if interface_name.contains("overlay") {
-        "overlay".to_string()
-    } else if interface_name.contains("gw") {
-        "vnic".to_string() // Gateway VNICs typically end with gw
-    } else {
-        "dev".to_string() // Default to generic device if we can't determine
-    }
 }
