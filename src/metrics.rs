@@ -367,7 +367,7 @@ async fn handle_force_detection_interfaces(
                   interface_name);
 
             // Try to detect this specific interface explicitly
-            if let Ok(interface) = force_interface_detection(
+            if let Ok(interface) = discovery::force_interface_detection(
                 Arc::clone(&client),
                 host_id,
                 &interface_name,
@@ -476,126 +476,6 @@ fn cleanup_metrics_buffer(unknown_metrics: &mut HashMap<String, Vec<NetworkMetri
 
         // Clean up empty entries again
         unknown_metrics.retain(|_, metrics| !metrics.is_empty());
-    }
-}
-
-// Function to force detection of a specific interface by querying dladm directly
-async fn force_interface_detection(
-    client: Arc<Client>,
-    host_id: Uuid,
-    interface_name: &str,
-    max_retries: usize,
-) -> Result<NetworkInterface> {
-    debug!("Attempting to force detection of interface: {}", interface_name);
-
-    let (interface_type, parent_interface) = determine_interface_type_and_parent(interface_name).await?;
-
-    // Create the interface record
-    let interface_id = discovery::ensure_interface_exists(
-        Arc::clone(&client),
-        host_id,
-        None, // Default to global zone
-        interface_name.to_string(),
-        interface_type.clone(),
-        parent_interface.clone(),
-        max_retries,
-    ).await?;
-
-    let interface = NetworkInterface {
-        interface_id,
-        host_id,
-        zone_id: None,
-        interface_name: interface_name.to_string(),
-        interface_type,
-        parent_interface,
-    };
-
-    info!("Created interface record for interface: {} (type: {}{})",
-         interface_name,
-         interface.interface_type,
-         match &interface.parent_interface {
-             Some(parent) => format!(", parent: {}", parent),
-             None => String::new(),
-         });
-
-    Ok(interface)
-}
-
-async fn determine_interface_type_and_parent(interface_name: &str) -> Result<(String, Option<String>)> {
-    // Try to get accurate interface type by querying dladm directly for this specific interface
-    let output = Command::new("/usr/sbin/dladm")
-        .args(&["show-link", "-p", "-o", "link,class", interface_name])
-        .output()
-        .context(format!("Failed to run dladm show-link for {}", interface_name))?;
-
-    let link_output = String::from_utf8(output.stdout)
-        .context("Invalid UTF-8 in dladm output")?;
-
-    // Default values
-    let mut interface_type = "dev".to_string(); // Default type
-    let mut parent_interface = None;
-
-    // Parse dladm output to get actual interface type
-    for line in link_output.lines() {
-        let fields: Vec<&str> = line.split(':').collect();
-        if fields.len() >= 2 && fields[0] == interface_name {
-            interface_type = fields[1].to_string();
-            break;
-        }
-    }
-
-    // If it's a VNIC, get the parent interface
-    if interface_type == "vnic" {
-        parent_interface = get_vnic_parent(interface_name).await?;
-    }
-
-    // If dladm didn't find the interface, fall back to guessing based on naming conventions
-    if link_output.trim().is_empty() {
-        debug!("Interface {} not found in dladm, using heuristics to determine type", interface_name);
-        interface_type = guess_interface_type(interface_name);
-    }
-
-    Ok((interface_type, parent_interface))
-}
-
-async fn get_vnic_parent(interface_name: &str) -> Result<Option<String>> {
-    let vnic_output = Command::new("/usr/sbin/dladm")
-        .args(&["show-vnic", "-p", "-o", "link,over", interface_name])
-        .output()
-        .context(format!("Failed to run dladm show-vnic for {}", interface_name))?;
-
-    let vnic_text = String::from_utf8(vnic_output.stdout)
-        .context("Invalid UTF-8 in dladm vnic output")?;
-
-    for line in vnic_text.lines() {
-        let fields: Vec<&str> = line.split(':').collect();
-        if fields.len() >= 2 && fields[0] == interface_name {
-            return Ok(Some(fields[1].to_string()));
-        }
-    }
-
-    Ok(None)
-}
-
-fn guess_interface_type(interface_name: &str) -> String {
-    if interface_name.starts_with("igb") ||
-       interface_name.starts_with("e1000g") ||
-       interface_name.starts_with("bge") ||
-       interface_name.starts_with("ixgbe") {
-        "phys".to_string()  // Physical device
-    } else if interface_name.ends_with("stub") ||
-              interface_name.contains("stub") {
-        "etherstub".to_string()
-    } else if interface_name.ends_with("0") &&
-              !interface_name.contains("gw") &&
-              !interface_name.starts_with("igb") {
-        "bridge".to_string()  // Likely a bridge (ends with 0)
-    } else if interface_name.contains("overlay") {
-        "overlay".to_string()
-    } else if interface_name.contains("gw") {
-        "vnic".to_string()  // Gateway VNICs typically end with gw
-    } else {
-        "dev".to_string()  // Default to generic device if we can't determine
     }
 }
 
