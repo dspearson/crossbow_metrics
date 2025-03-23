@@ -39,17 +39,11 @@ async fn main() -> Result<()> {
     // Connect to the database with TLS support
     let client = database::establish_connection(&db_url, &config.database.sslmode).await?;
 
-    // Ensure host exists
-    let host_id = database::ensure_host_exists(Arc::clone(&client), &hostname, max_retries).await?;
+    // Ensure host exists in the database before proceeding
+    let _ = database::ensure_host_exists(Arc::clone(&client), &hostname, max_retries).await?;
 
-    // Discover zones
-    let zones = discovery::discover_zones(Arc::clone(&client), host_id, max_retries).await?;
-
-    // Discover interfaces and build a mapping
-    let interface_map = discovery::discover_interfaces(Arc::clone(&client), host_id, &zones, max_retries).await?;
-
-    // Start the metrics collection loop with the hostname
-    metrics::collect_metrics(client, &interface_map, interval, max_retries, &hostname).await?;
+    // Start the metrics collection loop
+    metrics::collect_metrics(client, interval, max_retries, &hostname).await?;
 
     Ok(())
 }

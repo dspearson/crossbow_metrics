@@ -1,11 +1,13 @@
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct NetworkInterface {
     pub interface_id: Uuid,
+    #[allow(dead_code)]
     pub host_id: Uuid,
     pub zone_id: Option<Uuid>,
+    #[allow(dead_code)]
     pub interface_name: String,
     pub interface_type: String,
     pub parent_interface: Option<String>,
