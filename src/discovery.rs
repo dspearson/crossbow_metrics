@@ -100,6 +100,7 @@ pub async fn discover_interfaces(
     host_id: Uuid,
     zones: &HashMap<String, Uuid>,
     max_retries: usize,
+    verbose: bool,
 ) -> Result<HashMap<String, NetworkInterface>> {
     let mut interfaces = HashMap::new();
     let zone_interface_map: HashMap<String, Uuid> = HashMap::new();
@@ -113,7 +114,9 @@ pub async fn discover_interfaces(
     let link_output = String::from_utf8(output.stdout)
         .context("Invalid UTF-8 in dladm output")?;
 
-    println!("Discovering all interfaces...");
+    if verbose {
+        println!("Discovered interfaces:");
+    }
 
     // Process all links
     for line in link_output.lines() {
@@ -122,7 +125,9 @@ pub async fn discover_interfaces(
             let interface_name = fields[0].to_string();
             let interface_type = fields[1].to_string();
 
-            println!("Found interface: {} (type: {})", interface_name, interface_type);
+            if verbose {
+                println!("Found interface: {} (type: {})", interface_name, interface_type);
+            }
         }
     }
 
@@ -244,25 +249,27 @@ pub async fn discover_interfaces(
         }
     }
 
-    println!("Discovered {} interfaces", interfaces.len());
-    for (name, interface) in &interfaces {
-        let zone_info = match interface.zone_id {
-            Some(id) => {
-                let zone_name = zones.iter()
-                    .find(|&(_, zone_id)| *zone_id == id)
-                    .map(|(name, _)| name.clone())
-                    .unwrap_or_else(|| "unknown".to_string());
-                format!("zone: {}", zone_name)
-            },
-            None => "global zone".to_string(),
-        };
+    if verbose {
+        println!("Discovered {} interfaces", interfaces.len());
+        for (name, interface) in &interfaces {
+            let zone_info = match interface.zone_id {
+                Some(id) => {
+                    let zone_name = zones.iter()
+                                         .find(|&(_, zone_id)| *zone_id == id)
+                                         .map(|(name, _)| name.clone())
+                                         .unwrap_or_else(|| "unknown".to_string());
+                    format!("zone: {}", zone_name)
+                },
+                None => "global zone".to_string(),
+            };
 
-        println!("Interface: {} (type: {}, {}, parent: {:?})",
-                 name,
-                 interface.interface_type,
-                 zone_info,
-                 interface.parent_interface.as_deref().unwrap_or("none")
-        );
+            println!("Interface: {} (type: {}, {}, parent: {:?})",
+                     name,
+                     interface.interface_type,
+                     zone_info,
+                     interface.parent_interface.as_deref().unwrap_or("none")
+            );
+        }
     }
 
     Ok(interfaces)

@@ -1,10 +1,9 @@
 use crate::database;
 use crate::discovery;
-use crate::discovery::ensure_interface_exists;
 use crate::models::{NetworkInterface, NetworkMetric};
 use anyhow::{Context, Result};
 use chrono::Utc;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -27,6 +26,45 @@ pub struct MetricMessage {
     pub metrics: Vec<NetworkMetric>,
 }
 
+// Structure to track interface changes
+#[derive(Debug)]
+struct InterfaceTracker {
+    interfaces: HashMap<String, NetworkInterface>,
+    last_scan: chrono::DateTime<Utc>,
+}
+
+impl InterfaceTracker {
+    fn new(interfaces: HashMap<String, NetworkInterface>) -> Self {
+        InterfaceTracker {
+            interfaces,
+            last_scan: Utc::now(),
+        }
+    }
+
+    fn update(&mut self, new_interfaces: HashMap<String, NetworkInterface>) -> (Vec<String>, Vec<String>) {
+        let current_names: HashSet<String> = self.interfaces.keys().cloned().collect();
+        let new_names: HashSet<String> = new_interfaces.keys().cloned().collect();
+
+        // Find added and removed interfaces
+        let added: Vec<String> = new_names.difference(&current_names).cloned().collect();
+        let removed: Vec<String> = current_names.difference(&new_names).cloned().collect();
+
+        // Update the tracker with new interfaces
+        self.interfaces = new_interfaces;
+        self.last_scan = Utc::now();
+
+        (added, removed)
+    }
+
+    fn get(&self, interface_name: &str) -> Option<&NetworkInterface> {
+        self.interfaces.get(interface_name)
+    }
+
+    fn get_all(&self) -> &HashMap<String, NetworkInterface> {
+        &self.interfaces
+    }
+}
+
 pub async fn collect_metrics(
     client: Arc<Client>,
     interval_secs: u64,
@@ -41,9 +79,12 @@ pub async fn collect_metrics(
     // Discover initial interfaces
     let host_id = database::ensure_host_exists(Arc::clone(&client), hostname, max_retries).await?;
     let zones = discovery::discover_zones(Arc::clone(&client), host_id, max_retries).await?;
-    let mut interface_map = discovery::discover_interfaces(Arc::clone(&client), host_id, &zones, max_retries).await?;
+    let initial_interfaces = discovery::discover_interfaces(Arc::clone(&client), host_id, &zones, max_retries, true).await?;
 
-    println!("Initially discovered {} interfaces", interface_map.len());
+    // Initialize the interface tracker
+    let mut interface_tracker = InterfaceTracker::new(initial_interfaces);
+
+    println!("Initially discovered {} interfaces", interface_tracker.get_all().len());
 
     // Start the continuous metrics collection
     let mut metrics_rx = start_continuous_metrics_collection().await?;
@@ -51,10 +92,13 @@ pub async fn collect_metrics(
     // Create a channel for periodic interface rediscovery
     let (rediscover_tx, mut rediscover_rx) = tokio::sync::mpsc::channel::<()>(1);
 
-    // Spawn a task for periodic interface rediscovery
+    // Spawn a task for periodic interface rediscovery with initial delay
     let rediscover_interval = std::cmp::max(interval_secs * 10, 60);
 
     tokio::spawn(async move {
+        // Add delay before first rediscovery
+        tokio::time::sleep(Duration::from_secs(rediscover_interval)).await;
+
         let mut interval = tokio::time::interval(Duration::from_secs(rediscover_interval));
         loop {
             interval.tick().await;
@@ -65,40 +109,50 @@ pub async fn collect_metrics(
         }
     });
 
-    // Process metrics as they arrive and handle interface rediscovery
-    let mut total_metrics = 0;
+    // Create the status interval BEFORE the loop
     let mut status_interval = tokio::time::interval(Duration::from_secs(30));
+
+    // Track period metrics only
+    let mut period_metrics = 0;
+    let mut last_status_time = Utc::now();
 
     loop {
         tokio::select! {
             Some(message) = metrics_rx.recv() => {
                 match process_metrics_batch(
                     Arc::clone(&client),
-                    &interface_map,
+                    &interface_tracker,
                     message.metrics,
                     max_retries,
                     &mut unknown_metrics
                 ).await {
                     Ok(count) => {
-                        total_metrics += count;
+                        period_metrics += count;
                     },
                     Err(e) => eprintln!("Error storing metrics: {}", e),
                 }
-            }
-
-            _ = status_interval.tick() => {
-                println!("[{}] Status: Total metrics collected: {}",
-                         Utc::now().format("%H:%M:%S"),
-                         total_metrics);
             },
+            _ = status_interval.tick() => {
+                let now = Utc::now();
+                let seconds = (now - last_status_time).num_seconds().max(1); // Avoid division by zero
+                let rate = period_metrics as f64 / seconds as f64;
 
+                println!("[{}] Status: {} metrics collected in the last {} seconds (rate: {:.1} metrics/sec)",
+                         now.format("%H:%M:%S"),
+                         period_metrics,
+                         seconds,
+                         rate);
+
+                // Reset period counter
+                period_metrics = 0;
+                last_status_time = now;
+            },
             Some(_) = rediscover_rx.recv() => {
-                println!("Performing periodic interface rediscovery...");
                 match rediscover_interfaces(
                     Arc::clone(&client),
                     host_id,
                     &zones,
-                    &mut interface_map,
+                    &mut interface_tracker,
                     max_retries,
                     &mut unknown_metrics
                 ).await {
@@ -110,8 +164,7 @@ pub async fn collect_metrics(
                     },
                     Err(e) => eprintln!("Error during interface rediscovery: {}", e),
                 }
-            }
-
+            },
             else => break,
         }
     }
@@ -119,80 +172,80 @@ pub async fn collect_metrics(
     Ok(())
 }
 
-// Enhanced rediscover function with better buffer management
 async fn rediscover_interfaces(
     client: Arc<Client>,
     host_id: Uuid,
     zones: &HashMap<String, Uuid>,
-    interface_map: &mut HashMap<String, NetworkInterface>,
+    interface_tracker: &mut InterfaceTracker,
     max_retries: usize,
     unknown_metrics: &mut HashMap<String, Vec<NetworkMetric>>,
 ) -> Result<(usize, usize)> {
-    // Discover all current interfaces
+    // Discover current interfaces with reduced verbosity
     let current_interfaces = discovery::discover_interfaces(
         Arc::clone(&client),
         host_id,
         zones,
-        max_retries
+        max_retries,
+        false  // Less verbose during rediscovery
     ).await?;
 
-    // Count how many new interfaces we discover
-    let mut new_count = 0;
+    // Update tracker and get changes
+    let (added, removed) = interface_tracker.update(current_interfaces);
+
+    // Log changes if any
+    if !added.is_empty() {
+        println!("Discovered {} new interfaces:", added.len());
+        for name in &added {
+            let interface = interface_tracker.get(name).unwrap();
+            let parent_info = match &interface.parent_interface {
+                Some(parent) => format!(", parent: {}", parent),
+                None => String::new(),
+            };
+
+            println!("  - {} (type: {}{})",
+                    name,
+                    interface.interface_type,
+                    parent_info);
+        }
+    }
+
+    if !removed.is_empty() {
+        println!("Removed {} interfaces:", removed.len());
+        for name in &removed {
+            println!("  - {}", name);
+        }
+    }
+
+    // Count how many new interfaces discovered and metrics processed
     let mut processed_count = 0;
 
-    // Add any new interfaces to our map and process buffered metrics
-    for (name, interface) in current_interfaces {
-        let is_new = !interface_map.contains_key(&name);
+    // Process buffered metrics for newly discovered interfaces
+    for name in &added {
+        if let Some(metrics) = unknown_metrics.remove(name) {
+            let metrics_len = metrics.len();
+            println!("Processing {} buffered metrics for newly discovered interface {}",
+                     metrics_len, name);
 
-        if is_new {
-            println!("Discovered new interface: {}", name);
-            interface_map.insert(name.clone(), interface);
-            new_count += 1;
+            // Store the processed metrics count for this interface
+            let mut interface_processed = 0;
 
-            // Check if we have buffered metrics for this interface
-            if let Some(metrics) = unknown_metrics.remove(&name) {
-                println!("Processing {} buffered metrics for newly discovered interface {}",
-                        metrics.len(), name);
+            // Process each buffered metric
+            for metric in metrics {
+                let interface_id = interface_tracker.get(name).unwrap().interface_id;
 
-                // Process each buffered metric
-                for metric in metrics {
-                    let client = Arc::clone(&client);
-                    let interface_id = interface_map.get(&name).unwrap().interface_id;
-                    let timestamp = metric.timestamp;
-                    let input_bytes = metric.input_bytes;
-                    let input_packets = metric.input_packets;
-                    let output_bytes = metric.output_bytes;
-                    let output_packets = metric.output_packets;
-
-                    if let Ok(_) = execute_with_retry(move || {
-                        let client = Arc::clone(&client);
-                        Box::pin(async move {
-                            client
-                                .execute(
-                                    "INSERT INTO netmetrics (
-                                    interface_id, timestamp,
-                                    input_bytes, input_packets, output_bytes, output_packets,
-                                    collection_method
-                                    ) VALUES ($1, $2, $3, $4, $5, $6, $7)",
-                                    &[
-                                        &interface_id,
-                                        &timestamp,
-                                        &input_bytes,
-                                        &input_packets,
-                                        &output_bytes,
-                                        &output_packets,
-                                        &"dlstat",
-                                    ],
-                                )
-                                .await
-                                .context("Failed to insert buffered metrics")
-                        })
-                    }, max_retries)
-                    .await {
-                        processed_count += 1;
-                    }
+                if let Ok(_) = store_metric(
+                    Arc::clone(&client),
+                    interface_id,
+                    &metric,
+                    max_retries
+                ).await {
+                    processed_count += 1;
+                    interface_processed += 1;
                 }
             }
+
+            println!("Processed {}/{} buffered metrics for interface {}",
+                    interface_processed, metrics_len, name);
         }
     }
 
@@ -203,59 +256,46 @@ async fn rediscover_interfaces(
         .collect::<Vec<_>>();
 
     for interface_name in interfaces_to_force {
-        if !interface_map.contains_key(&interface_name) {
+        if interface_tracker.get(&interface_name).is_none() {
             println!("Forcing detection for unknown interface with {} buffered metrics: {}",
                     unknown_metrics.get(&interface_name).map(|m| m.len()).unwrap_or(0),
                     interface_name);
 
-            // Try to detect this specific interface explicitly
+            // Try to detect this specific interface explicitly by querying dladm
             if let Ok(interface) = force_interface_detection(
                 Arc::clone(&client),
                 host_id,
                 &interface_name,
                 max_retries
             ).await {
-                interface_map.insert(interface_name.clone(), interface);
-                new_count += 1;
+                // Update the tracker with the new interface
+                let mut updated_interfaces = interface_tracker.get_all().clone();
+                updated_interfaces.insert(interface_name.clone(), interface);
+                let (added, _) = interface_tracker.update(updated_interfaces);
 
-                // Process buffered metrics for this interface
-                if let Some(metrics) = unknown_metrics.remove(&interface_name) {
-                    for metric in metrics {
-                        let client = Arc::clone(&client);
-                        let interface_id = interface_map.get(&interface_name).unwrap().interface_id;
-                        let timestamp = metric.timestamp;
-                        let input_bytes = metric.input_bytes;
-                        let input_packets = metric.input_packets;
-                        let output_bytes = metric.output_bytes;
-                        let output_packets = metric.output_packets;
+                if !added.is_empty() {
+                    // Process buffered metrics for this interface
+                    if let Some(metrics) = unknown_metrics.remove(&interface_name) {
+                        // Store the processed metrics count for this interface
+                        let mut interface_processed = 0;
+                        let metrics_len = metrics.len();
 
-                        if let Ok(_) = execute_with_retry(move || {
-                            let client = Arc::clone(&client);
-                            Box::pin(async move {
-                                client
-                                    .execute(
-                                        "INSERT INTO netmetrics (
-                                        interface_id, timestamp,
-                                        input_bytes, input_packets, output_bytes, output_packets,
-                                        collection_method
-                                        ) VALUES ($1, $2, $3, $4, $5, $6, $7)",
-                                        &[
-                                            &interface_id,
-                                            &timestamp,
-                                            &input_bytes,
-                                            &input_packets,
-                                            &output_bytes,
-                                            &output_packets,
-                                            &"dlstat",
-                                        ],
-                                    )
-                                    .await
-                                    .context("Failed to insert buffered metrics")
-                            })
-                        }, max_retries)
-                        .await {
-                            processed_count += 1;
+                        for metric in metrics {
+                            let interface_id = interface_tracker.get(&interface_name).unwrap().interface_id;
+
+                            if let Ok(_) = store_metric(
+                                Arc::clone(&client),
+                                interface_id,
+                                &metric,
+                                max_retries
+                            ).await {
+                                processed_count += 1;
+                                interface_processed += 1;
+                            }
                         }
+
+                        println!("Processed {}/{} buffered metrics for newly detected interface {}",
+                                 interface_processed, metrics_len, interface_name);
                     }
                 }
             } else {
@@ -329,10 +369,10 @@ async fn rediscover_interfaces(
         unknown_metrics.retain(|_, metrics| !metrics.is_empty());
     }
 
-    Ok((new_count, processed_count))
+    Ok((added.len(), processed_count))
 }
 
-// Function to force detection of a specific interface
+// Function to force detection of a specific interface by querying dladm directly
 async fn force_interface_detection(
     client: Arc<Client>,
     host_id: Uuid,
@@ -341,35 +381,80 @@ async fn force_interface_detection(
 ) -> Result<NetworkInterface> {
     println!("Attempting to force detection of interface: {}", interface_name);
 
-    // Try to determine interface type based on naming conventions
-    let interface_type = if interface_name.starts_with("igb") ||
+    // Try to get accurate interface type by querying dladm directly for this specific interface
+    let output = Command::new("/usr/sbin/dladm")
+        .args(&["show-link", "-p", "-o", "link,class", interface_name])
+        .output()
+        .context(format!("Failed to run dladm show-link for {}", interface_name))?;
+
+    let link_output = String::from_utf8(output.stdout)
+        .context("Invalid UTF-8 in dladm output")?;
+
+    // Default values
+    let mut interface_type = "dev".to_string(); // Default type
+    let mut parent_interface = None;
+
+    // Parse dladm output to get actual interface type
+    for line in link_output.lines() {
+        let fields: Vec<&str> = line.split(':').collect();
+        if fields.len() >= 2 && fields[0] == interface_name {
+            interface_type = fields[1].to_string();
+            break;
+        }
+    }
+
+    // If it's a VNIC, get the parent interface
+    if interface_type == "vnic" {
+        let vnic_output = Command::new("/usr/sbin/dladm")
+            .args(&["show-vnic", "-p", "-o", "link,over", interface_name])
+            .output()
+            .context(format!("Failed to run dladm show-vnic for {}", interface_name))?;
+
+        let vnic_text = String::from_utf8(vnic_output.stdout)
+            .context("Invalid UTF-8 in dladm vnic output")?;
+
+        for line in vnic_text.lines() {
+            let fields: Vec<&str> = line.split(':').collect();
+            if fields.len() >= 2 && fields[0] == interface_name {
+                parent_interface = Some(fields[1].to_string());
+                break;
+            }
+        }
+    }
+
+    // If dladm didn't find the interface, fall back to guessing based on naming conventions
+    if link_output.trim().is_empty() {
+        println!("Interface {} not found in dladm, using heuristics to determine type", interface_name);
+
+        interface_type = if interface_name.starts_with("igb") ||
                           interface_name.starts_with("e1000g") ||
                           interface_name.starts_with("bge") ||
                           interface_name.starts_with("ixgbe") {
-        "phys".to_string()  // Physical device
-    } else if interface_name.ends_with("stub") ||
-              interface_name.contains("stub") {
-        "etherstub".to_string()
-    } else if interface_name.ends_with("0") &&
-              !interface_name.contains("gw") &&
-              !interface_name.starts_with("igb") {
-        "bridge".to_string()  // Likely a bridge (ends with 0)
-    } else if interface_name.contains("overlay") {
-        "overlay".to_string()
-    } else if interface_name.contains("gw") {
-        "vnic".to_string()  // Gateway VNICs typically end with gw
-    } else {
-        "dev".to_string()  // Default to generic device if we can't determine
-    };
+            "phys".to_string()  // Physical device
+        } else if interface_name.ends_with("stub") ||
+                  interface_name.contains("stub") {
+            "etherstub".to_string()
+        } else if interface_name.ends_with("0") &&
+                  !interface_name.contains("gw") &&
+                  !interface_name.starts_with("igb") {
+            "bridge".to_string()  // Likely a bridge (ends with 0)
+        } else if interface_name.contains("overlay") {
+            "overlay".to_string()
+        } else if interface_name.contains("gw") {
+            "vnic".to_string()  // Gateway VNICs typically end with gw
+        } else {
+            "dev".to_string()  // Default to generic device if we can't determine
+        };
+    }
 
     // Create the interface record
-    let interface_id = ensure_interface_exists(
+    let interface_id = discovery::ensure_interface_exists(
         Arc::clone(&client),
         host_id,
         None, // Default to global zone
         interface_name.to_string(),
-        interface_type.clone(), // Clone here before moving into the struct
-        None, // No parent information
+        interface_type.clone(),
+        parent_interface.clone(),
         max_retries,
     ).await?;
 
@@ -378,19 +463,24 @@ async fn force_interface_detection(
         host_id,
         zone_id: None,
         interface_name: interface_name.to_string(),
-        interface_type: interface_type.clone(), // Clone here to avoid move
-        parent_interface: None,
+        interface_type,
+        parent_interface,
     };
 
-    println!("Created interface record for unknown interface: {} (type: {})",
-             interface_name, interface_type);
+    println!("Created interface record for interface: {} (type: {}{})",
+             interface_name,
+             interface.interface_type,
+             match &interface.parent_interface {
+                 Some(parent) => format!(", parent: {}", parent),
+                 None => String::new(),
+             });
 
     Ok(interface)
 }
 
 async fn process_metrics_batch(
     client: Arc<Client>,
-    interface_map: &HashMap<String, NetworkInterface>,
+    interface_tracker: &InterfaceTracker,
     metrics: Vec<NetworkMetric>,
     max_retries: usize,
     unknown_metrics: &mut HashMap<String, Vec<NetworkMetric>>,
@@ -399,45 +489,16 @@ async fn process_metrics_batch(
     let mut unknown_count = 0;
 
     for metric in metrics {
-        if let Some(interface) = interface_map.get(&metric.interface_name) {
-            let client = Arc::clone(&client);
-            let interface_id = interface.interface_id;
-            let timestamp = metric.timestamp;
-            let input_bytes = metric.input_bytes;
-            let input_packets = metric.input_packets;
-            let output_bytes = metric.output_bytes;
-            let output_packets = metric.output_packets;
-
-            // We could store additional metadata like interface_type with each metric
-            // if that would be useful for querying later
-
-            execute_with_retry(move || {
-                let client = Arc::clone(&client);
-                Box::pin(async move {
-                    client
-                        .execute(
-                            "INSERT INTO netmetrics (
-                             interface_id, timestamp,
-                             input_bytes, input_packets, output_bytes, output_packets,
-                             collection_method
-                            ) VALUES ($1, $2, $3, $4, $5, $6, $7)",
-                            &[
-                                &interface_id,
-                                &timestamp,
-                                &input_bytes,
-                                &input_packets,
-                                &output_bytes,
-                                &output_packets,
-                                &"dlstat",
-                            ],
-                        )
-                        .await
-                        .context("Failed to insert metrics")
-                })
-            }, max_retries)
-            .await?;
-
-            stored_count += 1;
+        if let Some(interface) = interface_tracker.get(&metric.interface_name) {
+            // Use the helper function to store the metric
+            if let Ok(_) = store_metric(
+                Arc::clone(&client),
+                interface.interface_id,
+                &metric,
+                max_retries
+            ).await {
+                stored_count += 1;
+            }
         } else {
             // Store the metric for this unknown interface
             unknown_metrics
@@ -456,6 +517,48 @@ async fn process_metrics_batch(
     }
 
     Ok(stored_count)
+}
+
+// Helper function to store a single metric
+async fn store_metric(
+    client: Arc<Client>,
+    interface_id: Uuid,
+    metric: &NetworkMetric,
+    max_retries: usize
+) -> Result<()> {
+    execute_with_retry(move || {
+        let client = Arc::clone(&client);
+        let timestamp = metric.timestamp;
+        let input_bytes = metric.input_bytes;
+        let input_packets = metric.input_packets;
+        let output_bytes = metric.output_bytes;
+        let output_packets = metric.output_packets;
+
+        Box::pin(async move {
+            client
+                .execute(
+                    "INSERT INTO netmetrics (
+                    interface_id, timestamp,
+                    input_bytes, input_packets, output_bytes, output_packets,
+                    collection_method
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                    &[
+                        &interface_id,
+                        &timestamp,
+                        &input_bytes,
+                        &input_packets,
+                        &output_bytes,
+                        &output_packets,
+                        &"dlstat",
+                    ],
+                )
+                .await
+                .context("Failed to insert metrics")
+        })
+    }, max_retries)
+    .await?;
+
+    Ok(())
 }
 
 // Start a continuous metrics collection in the background
