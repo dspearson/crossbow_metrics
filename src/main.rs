@@ -6,12 +6,18 @@ mod models;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use config::{AppConfig, Args};
+use config::{AppConfig, Args, LogLevel};
+use env_logger::{Builder, Env};
+use log::{debug, error, info, warn};
 use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Parse CLI arguments
     let args = Args::parse();
+
+    // Initialize logging
+    initialize_logging(&args);
 
     // Load configuration
     let config = AppConfig::load(&args.config)
@@ -29,18 +35,19 @@ async fn main() -> Result<()> {
         None => config::get_hostname()?,
     };
 
-    println!("Database hosts: {}", config.database.hosts.join(", "));
+    info!("Database hosts: {}", config.database.hosts.join(", "));
+    debug!("Database connection URL format: postgresql://username:***@hosts/database");
 
     // Connect to the database with TLS support
-    println!("Establishing database connection...");
+    info!("Establishing database connection...");
     let client = match database::establish_connection(&db_url, &config.database.sslmode).await {
         Ok(client) => {
-            println!("Successfully connected to database");
+            info!("Successfully connected to database");
             client
         },
         Err(e) => {
-            eprintln!("Critical error: Failed to establish database connection: {}", e);
-            eprintln!("Aborting startup since database connection is required");
+            error!("Critical error: Failed to establish database connection: {}", e);
+            error!("Aborting startup since database connection is required");
             return Err(e);
         }
     };
@@ -49,7 +56,43 @@ async fn main() -> Result<()> {
     let _health_check_handle = database::start_connection_health_check(Arc::clone(&client));
 
     // Start the metrics collection loop
-    metrics::collect_metrics(client, max_retries, &hostname).await?;
+    info!("Starting metrics collection for host {}", hostname);
+    metrics::collect_metrics(client, max_retries, &hostname, args.verbose).await?;
 
     Ok(())
+}
+
+/// Initialize the logging system based on command-line arguments
+fn initialize_logging(args: &Args) {
+    let level = if args.quiet {
+        LogLevel::Error.to_filter()
+    } else {
+        args.log_level.to_filter()
+    };
+
+    // Create a default environment and override the log level
+    let env = Env::default().default_filter_or(level.to_string());
+
+    // Initialize with custom format
+    Builder::from_env(env)
+        .format(|buf, record| {
+            use std::io::Write;
+            use chrono::Local;
+
+            let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
+            let level_style = buf.default_level_style(record.level());
+
+            writeln!(
+                buf,
+                "{} {} [{}] {}",
+                timestamp,
+                level_style.value(record.level()),
+                record.target(),
+                record.args()
+            )
+        })
+        .init();
+
+    // Log startup information
+    debug!("Logging initialized at level: {}", level);
 }

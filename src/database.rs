@@ -1,4 +1,5 @@
 use anyhow::{Context, Error, Result};
+use log::{debug, error, info, trace, warn};
 use native_tls::TlsConnector;
 use postgres_native_tls::MakeTlsConnector;
 use rand::random;
@@ -12,6 +13,7 @@ use uuid::Uuid;
 
 pub async fn establish_connection(db_url: &str, sslmode: &str) -> Result<Arc<Client>> {
     if sslmode == "disable" {
+        debug!("Connecting to database without TLS");
         // Connect without TLS
         let (client, connection) = tokio_postgres::connect(db_url, tokio_postgres::NoTls)
             .await
@@ -19,7 +21,7 @@ pub async fn establish_connection(db_url: &str, sslmode: &str) -> Result<Arc<Cli
 
         tokio::spawn(async move {
             if let Err(e) = connection.await {
-                eprintln!("Database connection error: {}", e);
+                error!("Database connection error: {}", e);
             }
         });
 
@@ -32,6 +34,7 @@ pub async fn establish_connection(db_url: &str, sslmode: &str) -> Result<Arc<Cli
         return Ok(client_arc);
     }
 
+    debug!("Connecting to database with TLS (sslmode={})", sslmode);
     // Set up TLS
     let tls_builder = TlsConnector::builder();  // Removed 'mut' as it's not needed
 
@@ -52,7 +55,7 @@ pub async fn establish_connection(db_url: &str, sslmode: &str) -> Result<Arc<Cli
 
     tokio::spawn(async move {
         if let Err(e) = connection.await {
-            eprintln!("Database connection error: {}", e);
+            error!("Database connection error: {}", e);
         }
     });
 
@@ -67,7 +70,7 @@ pub async fn establish_connection(db_url: &str, sslmode: &str) -> Result<Arc<Cli
 
 // New function to validate a database connection
 pub async fn validate_connection(client: Arc<Client>) -> Result<()> {
-    println!("Validating database connection...");
+    debug!("Validating database connection...");
 
     // Set a short timeout for the validation query
     let timeout = Duration::from_secs(10);
@@ -75,12 +78,15 @@ pub async fn validate_connection(client: Arc<Client>) -> Result<()> {
     // Run a simple query with timeout
     match time::timeout(timeout, client.query_one("SELECT 1", &[])).await {
         Ok(Ok(_)) => {
+            debug!("Database connection is valid");
             Ok(())
         },
         Ok(Err(e)) => {
+            error!("Database validation failed: {}", e);
             Err(anyhow::anyhow!("Database validation failed: {}", e))
         },
         Err(_) => {
+            error!("Database validation timed out after {} seconds", timeout.as_secs());
             Err(anyhow::anyhow!("Database validation timed out after {} seconds", timeout.as_secs()))
         }
     }
@@ -88,15 +94,18 @@ pub async fn validate_connection(client: Arc<Client>) -> Result<()> {
 
 // New function to periodically check connection health
 pub async fn start_connection_health_check(client: Arc<Client>) -> tokio::task::JoinHandle<()> {
+    info!("Starting periodic database connection health checks");
     tokio::spawn(async move {
         let mut interval = time::interval(Duration::from_secs(30));
 
         loop {
             interval.tick().await;
             match validate_connection(Arc::clone(&client)).await {
-                Ok(_) => { /* Connection is healthy */ },
+                Ok(_) => {
+                    trace!("Database connection health check passed");
+                },
                 Err(e) => {
-                    eprintln!("Database connection check failed: {}", e);
+                    warn!("Database connection health check failed: {}", e);
                     // You could potentially set a flag or send a message to a channel here
                     // to signal to the main process that the connection is unhealthy
                 }
@@ -122,7 +131,7 @@ where
                 }
 
                 // Log the error and retry
-                eprintln!("Database operation failed (retry {}/{}): {}", retries, max_retries, e);
+                warn!("Database operation failed (retry {}/{}): {}", retries, max_retries, e);
                 time::sleep(delay).await;
 
                 // Exponential backoff with jitter
@@ -155,7 +164,7 @@ pub async fn ensure_host_exists(client: Arc<Client>, hostname: &str, max_retries
             let host_id = match row {
                 Some(row) => {
                     let host_id: Uuid = row.get(0);
-                    println!("Found existing host record: {}", host_id);
+                    debug!("Found existing host record: {}", host_id);
                     host_id
                 }
                 None => {
@@ -168,7 +177,7 @@ pub async fn ensure_host_exists(client: Arc<Client>, hostname: &str, max_retries
                         )
                         .await
                         .context("Failed to insert host")?;
-                    println!("Created new host record: {}", host_id);
+                    info!("Created new host record: {}", host_id);
                     host_id
                 }
             };

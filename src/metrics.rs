@@ -3,6 +3,7 @@ use crate::discovery;
 use crate::models::{NetworkInterface, NetworkMetric};
 use anyhow::{Context, Result};
 use chrono::Utc;
+use log::{debug, error, info, trace, warn};
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
@@ -69,10 +70,8 @@ pub async fn collect_metrics(
     client: Arc<Client>,
     max_retries: usize,
     hostname: &str,
+    verbose: bool,
 ) -> Result<()> {
-    // Log is now in main.rs before calling this function
-    // No need to log it again here
-
     let host_id = database::ensure_host_exists(Arc::clone(&client), hostname, max_retries).await?;
 
     // Start with an empty interface tracker - no initial discovery
@@ -82,15 +81,17 @@ pub async fn collect_metrics(
     let mut unknown_metrics: HashMap<String, Vec<NetworkMetric>> = HashMap::new();
 
     // Start the continuous metrics collection
+    info!("Starting continuous metrics collection");
     let mut metrics_rx = start_continuous_metrics_collection().await?;
 
     // Create a channel for periodic interface rediscovery
     let (rediscover_tx, mut rediscover_rx) = tokio::sync::mpsc::channel::<()>(1);
 
     // Trigger an immediate but non-blocking rediscovery to find interfaces in background
+    debug!("Triggering initial interface discovery");
     tokio::spawn(async move {
         if let Err(e) = rediscover_tx.send(()).await {
-            eprintln!("Failed to send rediscovery signal: {}", e);
+            error!("Failed to send rediscovery signal: {}", e);
         }
     });
 
@@ -101,6 +102,7 @@ pub async fn collect_metrics(
     let mut period_metrics = 0;
     let mut last_status_time = Utc::now();
 
+    info!("Entering main collection loop");
     loop {
         tokio::select! {
             Some(message) = metrics_rx.recv() => {
@@ -113,8 +115,9 @@ pub async fn collect_metrics(
                 ).await {
                     Ok(count) => {
                         period_metrics += count;
+                        trace!("Processed {} metrics in this batch", count);
                     },
-                    Err(e) => eprintln!("Error storing metrics: {}", e),
+                    Err(e) => error!("Error storing metrics: {}", e),
                 }
             },
 
@@ -124,17 +127,18 @@ pub async fn collect_metrics(
                 let rate = period_metrics as f64 / seconds as f64;
 
                 if period_metrics != 0 {
-                    println!("[{}] Status: {} metrics collected in the last {} seconds (rate: {:.1} metrics/sec)",
-                             now.format("%H:%M:%S"),
+                    info!("Status: {} metrics collected in the last {} seconds (rate: {:.1} metrics/sec)",
                              period_metrics,
                              seconds,
                              rate);
                     last_status_time = now;
                     period_metrics = 0;
+                } else {
+                    debug!("No metrics collected in the last {} seconds", seconds);
                 }
-
             },
             Some(_) = rediscover_rx.recv() => {
+                debug!("Starting interface rediscovery process");
                 let zones = discovery::discover_zones(Arc::clone(&client), host_id, max_retries).await?;
                 match rediscover_interfaces(
                     Arc::clone(&client),
@@ -142,15 +146,18 @@ pub async fn collect_metrics(
                     &zones,
                     &mut interface_tracker,
                     max_retries,
-                    &mut unknown_metrics
+                    &mut unknown_metrics,
+                    verbose
                 ).await {
                     Ok((new_count, processed_count)) => {
                         if new_count > 0 || processed_count > 0 {
-                            println!("Discovered {} new interfaces and processed {} buffered metrics",
+                            info!("Discovered {} new interfaces and processed {} buffered metrics",
                                     new_count, processed_count);
+                        } else {
+                            debug!("No new interfaces discovered during rediscovery");
                         }
                     },
-                    Err(e) => eprintln!("Error during interface rediscovery: {}", e),
+                    Err(e) => error!("Error during interface rediscovery: {}", e),
                 }
             },
             else => break,
@@ -167,14 +174,16 @@ async fn rediscover_interfaces(
     interface_tracker: &mut InterfaceTracker,
     max_retries: usize,
     unknown_metrics: &mut HashMap<String, Vec<NetworkMetric>>,
+    verbose: bool
 ) -> Result<(usize, usize)> {
-    // Discover current interfaces with reduced verbosity
+    // Discover current interfaces
+    debug!("Discovering current interfaces");
     let current_interfaces = discovery::discover_interfaces(
         Arc::clone(&client),
         host_id,
         zones,
         max_retries,
-        false  // Less verbose during rediscovery
+        verbose
     ).await?;
 
     // Update tracker and get changes
@@ -182,25 +191,35 @@ async fn rediscover_interfaces(
 
     // Log changes if any
     if !added.is_empty() {
-        println!("Discovered {} new interfaces:", added.len());
+        info!("Discovered {} new interfaces", added.len());
         for name in &added {
             let interface = interface_tracker.get(name).unwrap();
             let parent_info = match &interface.parent_interface {
                 Some(parent) => format!(", parent: {}", parent),
                 None => String::new(),
             };
+            let zone_info = match &interface.zone_id {
+                Some(zone_id) => {
+                    let zone_name = zones.iter()
+                        .find_map(|(name, id)| if id == zone_id { Some(name) } else { None })
+                        .unwrap_or(&"unknown".to_string());
+                    format!(", zone: {}", zone_name)
+                },
+                None => ", global zone".to_string(),
+            };
 
-            println!("  - {} (type: {}{})",
-                    name,
-                    interface.interface_type,
-                    parent_info);
+            debug!("New interface: {} (type: {}{}{})",
+                   name,
+                   interface.interface_type,
+                   parent_info,
+                   zone_info);
         }
     }
 
     if !removed.is_empty() {
-        println!("Removed {} interfaces:", removed.len());
+        info!("Removed {} interfaces", removed.len());
         for name in &removed {
-            println!("  - {}", name);
+            debug!("Removed interface: {}", name);
         }
     }
 
@@ -211,8 +230,7 @@ async fn rediscover_interfaces(
     for name in &added {
         if let Some(metrics) = unknown_metrics.remove(name) {
             let metrics_len = metrics.len();
-            println!("Processing {} buffered metrics for newly discovered interface {}",
-                     metrics_len, name);
+            info!("Processing {} buffered metrics for newly discovered interface {}", metrics_len, name);
 
             // Store the processed metrics count for this interface
             let mut interface_processed = 0;
@@ -232,8 +250,8 @@ async fn rediscover_interfaces(
                 }
             }
 
-            println!("Processed {}/{} buffered metrics for interface {}",
-                    interface_processed, metrics_len, name);
+            debug!("Processed {}/{} buffered metrics for interface {}",
+                   interface_processed, metrics_len, name);
         }
     }
 
@@ -245,9 +263,9 @@ async fn rediscover_interfaces(
 
     for interface_name in interfaces_to_force {
         if interface_tracker.get(&interface_name).is_none() {
-            println!("Forcing detection for unknown interface with {} buffered metrics: {}",
-                    unknown_metrics.get(&interface_name).map(|m| m.len()).unwrap_or(0),
-                    interface_name);
+            info!("Forcing detection for unknown interface with {} buffered metrics: {}",
+                  unknown_metrics.get(&interface_name).map(|m| m.len()).unwrap_or(0),
+                  interface_name);
 
             // Try to detect this specific interface explicitly by querying dladm
             if let Ok(interface) = force_interface_detection(
@@ -282,13 +300,13 @@ async fn rediscover_interfaces(
                             }
                         }
 
-                        println!("Processed {}/{} buffered metrics for newly detected interface {}",
-                                 interface_processed, metrics_len, interface_name);
+                        debug!("Processed {}/{} buffered metrics for newly detected interface {}",
+                               interface_processed, metrics_len, interface_name);
                     }
                 }
             } else {
-                println!("Failed to force detection for interface {}, metrics will remain buffered",
-                        interface_name);
+                debug!("Failed to force detection for interface {}, metrics will remain buffered",
+                      interface_name);
             }
         }
     }
@@ -304,8 +322,8 @@ async fn rediscover_interfaces(
         let removed = original_len - metrics.len();
 
         if removed > 0 {
-            println!("Dropped {} old buffered metrics for unknown interface {}",
-                    removed, interface_name);
+            debug!("Dropped {} old buffered metrics for unknown interface {}",
+                  removed, interface_name);
         }
 
         // 2. Size-based cleanup - limit metrics per interface
@@ -315,8 +333,8 @@ async fn rediscover_interfaces(
             let truncated = metrics.len() - MAX_METRICS_PER_INTERFACE;
             metrics.truncate(MAX_METRICS_PER_INTERFACE);
 
-            println!("Truncated {} excess buffered metrics for interface {}",
-                    truncated, interface_name);
+            debug!("Truncated {} excess buffered metrics for interface {}",
+                  truncated, interface_name);
         }
     }
 
@@ -326,8 +344,8 @@ async fn rediscover_interfaces(
     // 4. Global buffer size limit - if we exceed MAX_BUFFER_SIZE, drop oldest metrics
     let total_buffered = unknown_metrics.values().map(|v| v.len()).sum::<usize>();
     if total_buffered > MAX_BUFFER_SIZE {
-        println!("Buffer size ({}) exceeds maximum ({}), trimming oldest metrics",
-                total_buffered, MAX_BUFFER_SIZE);
+        info!("Buffer size ({}) exceeds maximum ({}), trimming oldest metrics",
+              total_buffered, MAX_BUFFER_SIZE);
 
         // Flatten all metrics into one vector with interface name
         let mut all_metrics = Vec::new();
@@ -351,7 +369,7 @@ async fn rediscover_interfaces(
             }
         }
 
-        println!("Removed {} oldest metrics from buffer", to_remove);
+        debug!("Removed {} oldest metrics from buffer", to_remove);
 
         // Clean up empty entries again
         unknown_metrics.retain(|_, metrics| !metrics.is_empty());
@@ -367,7 +385,7 @@ async fn force_interface_detection(
     interface_name: &str,
     max_retries: usize,
 ) -> Result<NetworkInterface> {
-    println!("Attempting to force detection of interface: {}", interface_name);
+    debug!("Attempting to force detection of interface: {}", interface_name);
 
     // Try to get accurate interface type by querying dladm directly for this specific interface
     let output = Command::new("/usr/sbin/dladm")
@@ -412,7 +430,7 @@ async fn force_interface_detection(
 
     // If dladm didn't find the interface, fall back to guessing based on naming conventions
     if link_output.trim().is_empty() {
-        println!("Interface {} not found in dladm, using heuristics to determine type", interface_name);
+        debug!("Interface {} not found in dladm, using heuristics to determine type", interface_name);
 
         interface_type = if interface_name.starts_with("igb") ||
                           interface_name.starts_with("e1000g") ||
@@ -455,13 +473,13 @@ async fn force_interface_detection(
         parent_interface,
     };
 
-    println!("Created interface record for interface: {} (type: {}{})",
-             interface_name,
-             interface.interface_type,
-             match &interface.parent_interface {
-                 Some(parent) => format!(", parent: {}", parent),
-                 None => String::new(),
-             });
+    info!("Created interface record for interface: {} (type: {}{})",
+         interface_name,
+         interface.interface_type,
+         match &interface.parent_interface {
+             Some(parent) => format!(", parent: {}", parent),
+             None => String::new(),
+         });
 
     Ok(interface)
 }
@@ -475,6 +493,8 @@ async fn process_metrics_batch(
 ) -> Result<usize> {
     let mut stored_count = 0;
     let mut unknown_count = 0;
+
+    trace!("Processing batch of {} metrics", metrics.len());
 
     for metric in metrics {
         if let Some(interface) = interface_tracker.get(&metric.interface_name) {
@@ -499,9 +519,9 @@ async fn process_metrics_batch(
     }
 
     if unknown_count > 0 {
-        println!("Buffered {} metrics for {} unknown interfaces",
-                 unknown_count,
-                 unknown_metrics.keys().collect::<std::collections::HashSet<_>>().len());
+        debug!("Buffered {} metrics for {} unknown interfaces",
+               unknown_count,
+               unknown_metrics.keys().collect::<std::collections::HashSet<_>>().len());
     }
 
     Ok(stored_count)
@@ -555,10 +575,11 @@ pub async fn start_continuous_metrics_collection() -> Result<mpsc::Receiver<Metr
     let (tx, rx) = mpsc::channel::<MetricMessage>(100);
 
     // Spawn a dedicated thread for the blocking I/O operations
+    info!("Starting metrics collection thread");
     thread::spawn(move || {
         let result = continuous_dlstat_collection(tx);
         if let Err(e) = result {
-            eprintln!("Metrics collection thread error: {}", e);
+            error!("Metrics collection thread error: {}", e);
         }
     });
 
@@ -568,6 +589,7 @@ pub async fn start_continuous_metrics_collection() -> Result<mpsc::Receiver<Metr
 // Function to run in the background thread that continuously reads from dlstat
 fn continuous_dlstat_collection(tx: mpsc::Sender<MetricMessage>) -> Result<()> {
     // Start dlstat with interval mode
+    debug!("Starting dlstat process with interval mode");
     let mut child = Command::new("/usr/sbin/dlstat")
         .args(&["-i", "1"])  // 1 second interval
         .stdout(Stdio::piped())
@@ -582,6 +604,8 @@ fn continuous_dlstat_collection(tx: mpsc::Sender<MetricMessage>) -> Result<()> {
     let mut current_metrics = Vec::new();
     let mut is_collecting = false;
 
+    info!("dlstat process started, reading data...");
+
     // Read lines continuously
     for line in reader.lines() {
         let line = line.context("Failed to read line from dlstat")?;
@@ -595,9 +619,11 @@ fn continuous_dlstat_collection(tx: mpsc::Sender<MetricMessage>) -> Result<()> {
                     metrics: current_metrics,
                 };
 
+                trace!("Sending {} metrics from dlstat", message.metrics.len());
+
                 // Try to send the metrics to the channel
                 if let Err(e) = tx.blocking_send(message) {
-                    eprintln!("Failed to send metrics: {}", e);
+                    error!("Failed to send metrics: {}", e);
                     break; // Receiver dropped, time to exit
                 }
 
@@ -645,7 +671,7 @@ fn continuous_dlstat_collection(tx: mpsc::Sender<MetricMessage>) -> Result<()> {
     }
 
     // If we get here, the process terminated
-    println!("dlstat process terminated");
+    warn!("dlstat process terminated");
     Ok(())
 }
 
@@ -692,7 +718,7 @@ where
                 }
 
                 // Log the error and retry
-                eprintln!("Database operation failed (retry {}/{}): {}", retries, max_retries, e);
+                warn!("Database operation failed (retry {}/{}): {}", retries, max_retries, e);
                 tokio::time::sleep(delay).await;
 
                 // Exponential backoff with jitter

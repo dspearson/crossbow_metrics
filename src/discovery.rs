@@ -1,6 +1,7 @@
 use crate::database::execute_with_retry;
 use crate::models::NetworkInterface;
 use anyhow::{Context, Error, Result};
+use log::{debug, error, info, trace, warn};
 use std::collections::HashMap;
 use std::process::Command;
 use std::sync::Arc;
@@ -11,6 +12,7 @@ pub async fn discover_zones(client: Arc<Client>, host_id: Uuid, max_retries: usi
     let mut zones = HashMap::new();
 
     // Get zone list from system
+    debug!("Retrieving zone list from system");
     let output = Command::new("/usr/sbin/zoneadm")
         .arg("list")
         .arg("-p")
@@ -29,6 +31,8 @@ pub async fn discover_zones(client: Arc<Client>, host_id: Uuid, max_retries: usi
             } else {
                 None
             };
+
+            trace!("Processing zone: {} (status: {:?})", zone_name, zone_status);
 
             // Check if zone exists in database with retry logic
             let zone_client = Arc::clone(&client);
@@ -64,6 +68,7 @@ pub async fn discover_zones(client: Arc<Client>, host_id: Uuid, max_retries: usi
                                     .await
                                     .context("Failed to update zone status")?;
                             }
+                            debug!("Found existing zone record: {} - {}", zone_name, id);
                             id
                         }
                         None => {
@@ -77,7 +82,7 @@ pub async fn discover_zones(client: Arc<Client>, host_id: Uuid, max_retries: usi
                                 )
                                 .await
                                 .context("Failed to insert zone")?;
-                            println!("Created new zone record: {} - {}", zone_name, id);
+                            info!("Created new zone record: {} - {}", zone_name, id);
                             id
                         }
                     };
@@ -91,7 +96,8 @@ pub async fn discover_zones(client: Arc<Client>, host_id: Uuid, max_retries: usi
         }
     }
 
-    println!("Discovered {} zones", zones.len());
+    info!("Discovered {} zones", zones.len());
+    trace!("Zone details: {:#?}", zones);
     Ok(zones)
 }
 
@@ -108,6 +114,7 @@ pub async fn discover_interfaces(
     let zone_interface_map = build_zone_interface_map(zones, verbose).await?;
 
     // Get all datalinks (including physical, etherstub, vnic)
+    debug!("Retrieving datalink information from system");
     let output = Command::new("/usr/sbin/dladm")
         .args(&["show-link", "-p", "-o", "link,class"])
         .output()
@@ -117,7 +124,7 @@ pub async fn discover_interfaces(
         .context("Invalid UTF-8 in dladm output")?;
 
     if verbose {
-        println!("Discovered interfaces:");
+        debug!("Discovered interfaces:");
     }
 
     // Process all links
@@ -128,12 +135,13 @@ pub async fn discover_interfaces(
             let interface_type = fields[1].to_string();
 
             if verbose {
-                println!("Found interface: {} (type: {})", interface_name, interface_type);
+                trace!("Found interface: {} (type: {})", interface_name, interface_type);
             }
         }
     }
 
     // Get VNIC parent relationships
+    debug!("Retrieving VNIC parent relationships");
     let vnic_output = Command::new("/usr/sbin/dladm")
         .args(&["show-vnic", "-p", "-o", "link,over"])
         .output()
@@ -154,6 +162,7 @@ pub async fn discover_interfaces(
     }
 
     // First process all physical interfaces
+    debug!("Processing physical interfaces");
     for line in link_output.lines() {
         let fields: Vec<&str> = line.split(':').collect();
         if fields.len() >= 2 {
@@ -162,6 +171,7 @@ pub async fn discover_interfaces(
 
             if interface_type == "phys" {
                 // It's a physical interface
+                trace!("Processing physical interface: {}", interface_name);
                 let interface_id = ensure_interface_exists(
                     Arc::clone(&client),
                     host_id,
@@ -185,6 +195,7 @@ pub async fn discover_interfaces(
     }
 
     // Next process all etherstubs
+    debug!("Processing etherstub interfaces");
     for line in link_output.lines() {
         let fields: Vec<&str> = line.split(':').collect();
         if fields.len() >= 2 {
@@ -193,6 +204,7 @@ pub async fn discover_interfaces(
 
             if interface_type == "etherstub" {
                 // It's an etherstub
+                trace!("Processing etherstub interface: {}", interface_name);
                 let interface_id = ensure_interface_exists(
                     Arc::clone(&client),
                     host_id,
@@ -216,6 +228,7 @@ pub async fn discover_interfaces(
     }
 
     // Finally process all VNICs
+    debug!("Processing VNIC interfaces");
     for line in link_output.lines() {
         let fields: Vec<&str> = line.split(':').collect();
         if fields.len() >= 2 {
@@ -225,6 +238,7 @@ pub async fn discover_interfaces(
             if interface_type == "vnic" {
                 // It's a VNIC - get its parent
                 let parent_interface = vnic_parents.get(&interface_name).cloned();
+                trace!("Processing VNIC interface: {} (parent: {:?})", interface_name, parent_interface);
 
                 // Get the zone_id for this interface (default to None for global zone)
                 let zone_id = zone_interface_map.get(&interface_name).cloned();
@@ -233,9 +247,9 @@ pub async fn discover_interfaces(
                     // Using a let binding to create a longer-lived value
                     let unknown = "unknown".to_string();
                     let zone_name = zones.iter()
-                        .find_map(|(name, id)| if *id == zone_id.unwrap() { Some(name) } else { None })
+                        .find_map(|(name, id)| if id == zone_id.unwrap() { Some(name) } else { None })
                         .unwrap_or(&unknown);
-                    println!("Interface {} belongs to zone {}", interface_name, zone_name);
+                    debug!("Interface {} belongs to zone {}", interface_name, zone_name);
                 }
 
                 let interface_id = ensure_interface_exists(
@@ -260,8 +274,10 @@ pub async fn discover_interfaces(
         }
     }
 
+    info!("Discovered {} interfaces", interfaces.len());
+
     if verbose {
-        println!("Discovered {} interfaces", interfaces.len());
+        debug!("Interface details:");
         for (name, interface) in &interfaces {
             let zone_info = match interface.zone_id {
                 Some(id) => {
@@ -274,11 +290,11 @@ pub async fn discover_interfaces(
                 None => "global zone".to_string(),
             };
 
-            println!("Interface: {} (type: {}, {}, parent: {:?})",
-                     name,
-                     interface.interface_type,
-                     zone_info,
-                     interface.parent_interface.as_deref().unwrap_or("none")
+            debug!("Interface: {} (type: {}, {}, parent: {:?})",
+                   name,
+                   interface.interface_type,
+                   zone_info,
+                   interface.parent_interface.as_deref().unwrap_or("none")
             );
         }
     }
@@ -286,14 +302,14 @@ pub async fn discover_interfaces(
     Ok(interfaces)
 }
 
-// This is a comprehensive function to build the mapping between interface names and zone IDs
+// Function to build the mapping between interface names and zone IDs
 async fn build_zone_interface_map(
     zones: &HashMap<String, Uuid>,
     verbose: bool,
 ) -> Result<HashMap<String, Uuid>> {
     let mut zone_interface_map = HashMap::new();
 
-    println!("Building zone-interface map with {} zones", zones.len());
+    info!("Building zone-interface map with {} zones", zones.len());
 
     // Check non-global zones using zonecfg info net
     for (zone_name, zone_uuid) in zones {
@@ -302,7 +318,7 @@ async fn build_zone_interface_map(
             continue;
         }
 
-        println!("Checking zone {} for net resources", zone_name);
+        debug!("Checking zone {} for net resources", zone_name);
 
         // Get network interfaces defined in the zone
         let zonecfg_output = Command::new("/usr/sbin/zonecfg")
@@ -313,9 +329,9 @@ async fn build_zone_interface_map(
             let zonecfg_text = String::from_utf8_lossy(&output.stdout).to_string();
 
             if verbose {
-                println!("  zonecfg output for zone {}:", zone_name);
+                trace!("zonecfg output for zone {}:", zone_name);
                 for line in zonecfg_text.lines() {
-                    println!("    {}", line);
+                    trace!("  {}", line);
                 }
             }
 
@@ -338,19 +354,19 @@ async fn build_zone_interface_map(
                     if let Some(iface_name) = line.split(':').nth(1) {
                         let interface_name = iface_name.trim().to_string();
 
-                        println!("  Found interface {} in zone {}", interface_name, zone_name);
+                        info!("Found interface {} in zone {}", interface_name, zone_name);
                         zone_interface_map.insert(interface_name, *zone_uuid);
                     }
                 }
             }
         } else if let Err(e) = &zonecfg_output {
-            println!("  Error running zonecfg for {}: {}", zone_name, e);
+            warn!("Error running zonecfg for {}: {}", zone_name, e);
         }
     }
 
     // If we still don't have any mappings, try with dladm show-link -Z
     if zone_interface_map.is_empty() {
-        println!("No mappings found with zonecfg, trying dladm show-link -Z");
+        info!("No mappings found with zonecfg, trying dladm show-link -Z");
 
         let dladm_output = Command::new("/usr/sbin/dladm")
             .args(&["show-link", "-Z", "-p", "-o", "link,zone"])
@@ -360,9 +376,9 @@ async fn build_zone_interface_map(
             let link_text = String::from_utf8_lossy(&output.stdout).to_string();
 
             if verbose {
-                println!("  dladm show-link -Z output:");
+                trace!("dladm show-link -Z output:");
                 for line in link_text.lines() {
-                    println!("    {}", line);
+                    trace!("  {}", line);
                 }
             }
 
@@ -374,7 +390,7 @@ async fn build_zone_interface_map(
 
                     if !zone_name.is_empty() && zone_name != "global" {
                         if let Some(zone_uuid) = zones.get(zone_name) {
-                            println!("  Associating interface {} with zone {}", interface_name, zone_name);
+                            info!("Associating interface {} with zone {}", interface_name, zone_name);
                             zone_interface_map.insert(interface_name.to_string(), *zone_uuid);
                         }
                     }
@@ -385,9 +401,9 @@ async fn build_zone_interface_map(
 
     // Display the mapping we've built
     if zone_interface_map.is_empty() {
-        println!("WARNING: No zone-interface mappings found!");
+        warn!("WARNING: No zone-interface mappings found!");
     } else {
-        println!("Built zone-interface map with {} entries:", zone_interface_map.len());
+        info!("Built zone-interface map with {} entries:", zone_interface_map.len());
 
         for (interface, zone_uuid) in &zone_interface_map {
             // Find zone name for the UUID
@@ -398,7 +414,7 @@ async fn build_zone_interface_map(
                 .find_map(|(name, id)| if id == zone_uuid { Some(name) } else { None })
                 .unwrap_or(&unknown);
 
-            println!("  Interface {} → Zone {} ({})", interface, zone_name, zone_uuid);
+            debug!("Interface {} → Zone {} ({})", interface, zone_name, zone_uuid);
         }
     }
 
@@ -448,6 +464,13 @@ pub async fn ensure_interface_exists(
                         )
                         .await
                         .context("Failed to update interface")?;
+
+                    let zone_desc = match &zone_id {
+                        Some(id) => format!("zone ID: {}", id),
+                        None => "global zone".to_string(),
+                    };
+
+                    trace!("Updated existing interface record: {} - {} ({})", interface_name, interface_id, zone_desc);
                     interface_id
                 }
                 None => {
@@ -463,7 +486,13 @@ pub async fn ensure_interface_exists(
                         )
                         .await
                         .context("Failed to insert interface")?;
-                    println!("Created new interface record: {} - {}", interface_name, interface_id);
+
+                    let zone_desc = match &zone_id {
+                        Some(id) => format!("zone ID: {}", id),
+                        None => "global zone".to_string(),
+                    };
+
+                    info!("Created new interface record: {} - {} ({})", interface_name, interface_id, zone_desc);
                     interface_id
                 }
             };

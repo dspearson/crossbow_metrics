@@ -1,8 +1,50 @@
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use config::{Config, ConfigError, File};
 use serde::Deserialize;
 use std::process::Command;
+use std::str::FromStr;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
+pub enum LogLevel {
+    /// Only show errors
+    Error,
+    /// Show errors and warnings
+    Warn,
+    /// Show errors, warnings, and info (default)
+    Info,
+    /// Show errors, warnings, info, and debug messages
+    Debug,
+    /// Show all messages including trace
+    Trace,
+}
+
+impl FromStr for LogLevel {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "error" => Ok(LogLevel::Error),
+            "warn" => Ok(LogLevel::Warn),
+            "info" => Ok(LogLevel::Info),
+            "debug" => Ok(LogLevel::Debug),
+            "trace" => Ok(LogLevel::Trace),
+            _ => Err(format!("Unknown log level: {}", s)),
+        }
+    }
+}
+
+impl LogLevel {
+    pub fn to_filter(&self) -> log::LevelFilter {
+        match self {
+            LogLevel::Error => log::LevelFilter::Error,
+            LogLevel::Warn => log::LevelFilter::Warn,
+            LogLevel::Info => log::LevelFilter::Info,
+            LogLevel::Debug => log::LevelFilter::Debug,
+            LogLevel::Trace => log::LevelFilter::Trace,
+        }
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -14,6 +56,18 @@ pub struct Args {
     /// Hostname to use for metrics collection
     #[arg(long)]
     pub hostname: Option<String>,
+
+    /// Verbosity level for logging
+    #[arg(short, long, default_value = "info")]
+    pub log_level: LogLevel,
+
+    /// Quiet mode (errors only, overrides log-level)
+    #[arg(short, long)]
+    pub quiet: bool,
+
+    /// Show additional detail
+    #[arg(short, long)]
+    pub verbose: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -30,6 +84,7 @@ pub struct DatabaseConfig {
 pub struct AppConfig {
     pub database: DatabaseConfig,
     pub max_retries: Option<usize>,
+    pub log_level: Option<String>,
 }
 
 impl AppConfig {
@@ -58,6 +113,13 @@ impl AppConfig {
             hosts,
             self.database.database
         )
+    }
+
+    pub fn get_log_level(&self) -> LogLevel {
+        match &self.log_level {
+            Some(level) => LogLevel::from_str(level).unwrap_or(LogLevel::Info),
+            None => LogLevel::Info,
+        }
     }
 }
 
