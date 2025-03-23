@@ -75,7 +75,6 @@ pub async fn validate_connection(client: Arc<Client>) -> Result<()> {
     // Run a simple query with timeout
     match time::timeout(timeout, client.query_one("SELECT 1", &[])).await {
         Ok(Ok(_)) => {
-            println!("Database connection is valid");
             Ok(())
         },
         Ok(Err(e)) => {
