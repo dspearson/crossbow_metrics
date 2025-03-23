@@ -19,9 +19,6 @@ async fn main() -> Result<()> {
     // Get database connection string
     let db_url = config.get_connection_string();
 
-    // Get interval from CLI args or config file
-    let interval = args.interval.unwrap_or_else(|| config.interval.unwrap_or(60));
-
     // Get max retries
     let max_retries = config.max_retries.unwrap_or(5);
 
@@ -31,15 +28,13 @@ async fn main() -> Result<()> {
         None => config::get_hostname()?,
     };
 
-    println!("Collecting network metrics for host: {}", hostname);
-    println!("Collection interval: {} seconds", interval);
     println!("Database hosts: {}", config.database.hosts.join(", "));
 
     // Connect to the database with TLS support
     let client = database::establish_connection(&db_url, &config.database.sslmode).await?;
 
     // Start the metrics collection loop
-    metrics::collect_metrics(client, interval, max_retries, &hostname).await?;
+    metrics::collect_metrics(client, max_retries, &hostname).await?;
 
     Ok(())
 }

@@ -67,24 +67,19 @@ impl InterfaceTracker {
 
 pub async fn collect_metrics(
     client: Arc<Client>,
-    interval_secs: u64,
     max_retries: usize,
     hostname: &str,
 ) -> Result<()> {
     println!("Starting metrics collection for host {}", hostname);
 
-    // Buffer for metrics from unknown interfaces
-    let mut unknown_metrics: HashMap<String, Vec<NetworkMetric>> = HashMap::new();
-
-    // Discover initial interfaces
     let host_id = database::ensure_host_exists(Arc::clone(&client), hostname, max_retries).await?;
     let zones = discovery::discover_zones(Arc::clone(&client), host_id, max_retries).await?;
-    let initial_interfaces = discovery::discover_interfaces(Arc::clone(&client), host_id, &zones, max_retries, true).await?;
 
-    // Initialize the interface tracker
-    let mut interface_tracker = InterfaceTracker::new(initial_interfaces);
+    // Start with an empty interface tracker - no initial discovery
+    let mut interface_tracker = InterfaceTracker::new(HashMap::new());
 
-    println!("Initially discovered {} interfaces", interface_tracker.get_all().len());
+    // Create a buffer for metrics from unknown interfaces
+    let mut unknown_metrics: HashMap<String, Vec<NetworkMetric>> = HashMap::new();
 
     // Start the continuous metrics collection
     let mut metrics_rx = start_continuous_metrics_collection().await?;
@@ -92,20 +87,10 @@ pub async fn collect_metrics(
     // Create a channel for periodic interface rediscovery
     let (rediscover_tx, mut rediscover_rx) = tokio::sync::mpsc::channel::<()>(1);
 
-    // Spawn a task for periodic interface rediscovery with initial delay
-    let rediscover_interval = std::cmp::max(interval_secs * 10, 60);
-
+    // Trigger an immediate but non-blocking rediscovery to find interfaces in background
     tokio::spawn(async move {
-        // Add delay before first rediscovery
-        tokio::time::sleep(Duration::from_secs(rediscover_interval)).await;
-
-        let mut interval = tokio::time::interval(Duration::from_secs(rediscover_interval));
-        loop {
-            interval.tick().await;
-            if let Err(e) = rediscover_tx.send(()).await {
-                eprintln!("Failed to send rediscovery signal: {}", e);
-                break;
-            }
+        if let Err(e) = rediscover_tx.send(()).await {
+            eprintln!("Failed to send rediscovery signal: {}", e);
         }
     });
 
@@ -132,20 +117,22 @@ pub async fn collect_metrics(
                     Err(e) => eprintln!("Error storing metrics: {}", e),
                 }
             },
+
             _ = status_interval.tick() => {
                 let now = Utc::now();
                 let seconds = (now - last_status_time).num_seconds().max(1); // Avoid division by zero
                 let rate = period_metrics as f64 / seconds as f64;
 
-                println!("[{}] Status: {} metrics collected in the last {} seconds (rate: {:.1} metrics/sec)",
-                         now.format("%H:%M:%S"),
-                         period_metrics,
-                         seconds,
-                         rate);
+                if period_metrics != 0 {
+                    println!("[{}] Status: {} metrics collected in the last {} seconds (rate: {:.1} metrics/sec)",
+                             now.format("%H:%M:%S"),
+                             period_metrics,
+                             seconds,
+                             rate);
+                    last_status_time = now;
+                    period_metrics = 0;
+                }
 
-                // Reset period counter
-                period_metrics = 0;
-                last_status_time = now;
             },
             Some(_) = rediscover_rx.recv() => {
                 match rediscover_interfaces(
@@ -623,12 +610,6 @@ fn continuous_dlstat_collection(tx: mpsc::Sender<MetricMessage>) -> Result<()> {
             // Skip the first section (cumulative stats since boot)
             // Only start collecting from the second section onwards
             is_collecting = section_count > 1;
-
-            if section_count <= 2 {
-                println!("Section {}: {} metrics collection",
-                        section_count,
-                        if is_collecting { "Starting" } else { "Skipping" });
-            }
 
             continue;
         }

@@ -14,10 +14,6 @@ pub struct Args {
     /// Hostname to use for metrics collection
     #[arg(long)]
     pub hostname: Option<String>,
-
-    /// Collection interval in seconds (overrides config file if specified)
-    #[arg(short, long)]
-    pub interval: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -33,7 +29,6 @@ pub struct DatabaseConfig {
 #[derive(Debug, Deserialize)]
 pub struct AppConfig {
     pub database: DatabaseConfig,
-    pub interval: Option<u64>,
     pub max_retries: Option<usize>,
 }
 
