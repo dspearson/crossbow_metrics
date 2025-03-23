@@ -17,25 +17,18 @@ async fn get_interface_details(interface_name: &str) -> Result<(Option<String>, 
     // Try to get MAC address using dladm show-vnic first (specific for VNICs)
     trace!("Attempting to get MAC address for {} via dladm show-vnic", interface_name);
     let vnic_output = Command::new("/usr/sbin/dladm")
-        .args(&["show-vnic", "-p", "-o", "link,macaddress", interface_name])
+        .args(&["show-vnic", "-p", "-o", "macaddress", interface_name])
         .output();
 
     if let Ok(output) = vnic_output {
         if output.status.success() {
-            let mac_text = String::from_utf8_lossy(&output.stdout).to_string();
-            for line in mac_text.lines() {
-                let fields: Vec<&str> = line.split(':').collect();
-                if fields.len() >= 2 && fields[0] == interface_name {
-                    let raw_mac = fields[1].trim();
-                    if !raw_mac.is_empty() && raw_mac != "0" {
-                        let formatted_mac = format_mac_address(raw_mac)?;
-                        if !formatted_mac.is_empty() {
-                            mac_address = Some(formatted_mac);
-                            debug!("Found MAC address for {} with VNIC method: {}",
-                                  interface_name, mac_address.as_ref().unwrap());
-                            break;
-                        }
-                    }
+            let mac_text = String::from_utf8_lossy(&output.stdout).to_string().trim().to_string();
+            if !mac_text.is_empty() {
+                let formatted_mac = format_mac_address(&mac_text)?;
+                if !formatted_mac.is_empty() {
+                    mac_address = Some(formatted_mac);
+                    debug!("Found MAC address for {} with VNIC method: {}",
+                          interface_name, mac_address.as_ref().unwrap());
                 }
             }
         } else {
@@ -47,25 +40,18 @@ async fn get_interface_details(interface_name: &str) -> Result<(Option<String>, 
     if mac_address.is_none() {
         trace!("Attempting to get MAC address for {} via dladm show-phys", interface_name);
         let mac_output = Command::new("/usr/sbin/dladm")
-            .args(&["show-phys", "-p", "-o", "link,macaddress", interface_name])
+            .args(&["show-phys", "-p", "-o", "macaddress", interface_name])
             .output();
 
         if let Ok(output) = mac_output {
             if output.status.success() {
-                let mac_text = String::from_utf8_lossy(&output.stdout).to_string();
-                for line in mac_text.lines() {
-                    let fields: Vec<&str> = line.split(':').collect();
-                    if fields.len() >= 2 && fields[0] == interface_name {
-                        let raw_mac = fields[1].trim();
-                        if !raw_mac.is_empty() && raw_mac != "0" {
-                            let formatted_mac = format_mac_address(raw_mac)?;
-                            if !formatted_mac.is_empty() {
-                                mac_address = Some(formatted_mac);
-                                debug!("Found MAC address for {}: {}",
-                                      interface_name, mac_address.as_ref().unwrap());
-                                break;
-                            }
-                        }
+                let mac_text = String::from_utf8_lossy(&output.stdout).to_string().trim().to_string();
+                if !mac_text.is_empty() {
+                    let formatted_mac = format_mac_address(&mac_text)?;
+                    if !formatted_mac.is_empty() {
+                        mac_address = Some(formatted_mac);
+                        debug!("Found MAC address for {}: {}",
+                              interface_name, mac_address.as_ref().unwrap());
                     }
                 }
             } else {
@@ -78,25 +64,18 @@ async fn get_interface_details(interface_name: &str) -> Result<(Option<String>, 
     if mac_address.is_none() {
         trace!("Attempting to get MAC address for {} via dladm show-link", interface_name);
         let alt_mac_output = Command::new("/usr/sbin/dladm")
-            .args(&["show-link", "-p", "-o", "link,macaddress", interface_name])
+            .args(&["show-link", "-p", "-o", "macaddress", interface_name])
             .output();
 
         if let Ok(output) = alt_mac_output {
             if output.status.success() {
-                let mac_text = String::from_utf8_lossy(&output.stdout).to_string();
-                for line in mac_text.lines() {
-                    let fields: Vec<&str> = line.split(':').collect();
-                    if fields.len() >= 2 && fields[0] == interface_name {
-                        let raw_mac = fields[1].trim();
-                        if !raw_mac.is_empty() && raw_mac != "0" {
-                            let formatted_mac = format_mac_address(raw_mac)?;
-                            if !formatted_mac.is_empty() {
-                                mac_address = Some(formatted_mac);
-                                debug!("Found MAC address for {} with alternative method: {}",
-                                      interface_name, mac_address.as_ref().unwrap());
-                                break;
-                            }
-                        }
+                let mac_text = String::from_utf8_lossy(&output.stdout).to_string().trim().to_string();
+                if !mac_text.is_empty() {
+                    let formatted_mac = format_mac_address(&mac_text)?;
+                    if !formatted_mac.is_empty() {
+                        mac_address = Some(formatted_mac);
+                        debug!("Found MAC address for {} with alternative method: {}",
+                              interface_name, mac_address.as_ref().unwrap());
                     }
                 }
             } else {
@@ -112,22 +91,18 @@ async fn get_interface_details(interface_name: &str) -> Result<(Option<String>, 
     // Try to get MTU using dladm show-link
     trace!("Attempting to get MTU for {}", interface_name);
     let mtu_output = Command::new("/usr/sbin/dladm")
-        .args(&["show-link", "-p", "-o", "link,mtu", interface_name])
+        .args(&["show-link", "-p", "-o", "mtu", interface_name])
         .output();
 
     if let Ok(output) = mtu_output {
         if output.status.success() {
-            let mtu_text = String::from_utf8_lossy(&output.stdout).to_string();
-            for line in mtu_text.lines() {
-                let fields: Vec<&str> = line.split(':').collect();
-                if fields.len() >= 2 && fields[0] == interface_name {
-                    if let Ok(mtu_value) = fields[1].trim().parse::<i64>() {
-                        if mtu_value > 0 {
-                            mtu = Some(mtu_value);
-                            debug!("Found MTU for {}: {}", interface_name, mtu_value);
-                        }
+            let mtu_text = String::from_utf8_lossy(&output.stdout).to_string().trim().to_string();
+            if !mtu_text.is_empty() {
+                if let Ok(mtu_value) = mtu_text.parse::<i64>() {
+                    if mtu_value > 0 {
+                        mtu = Some(mtu_value);
+                        debug!("Found MTU for {}: {}", interface_name, mtu_value);
                     }
-                    break;
                 }
             }
         } else {
