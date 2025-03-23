@@ -66,6 +66,9 @@ pub async fn collect_metrics(
     });
 
     // Process metrics as they arrive and handle interface rediscovery
+    let mut total_metrics = 0;
+    let mut status_interval = tokio::time::interval(Duration::from_secs(30));
+
     loop {
         tokio::select! {
             Some(message) = metrics_rx.recv() => {
@@ -77,13 +80,17 @@ pub async fn collect_metrics(
                     &mut unknown_metrics
                 ).await {
                     Ok(count) => {
-                        if count > 0 {
-                            println!("Successfully stored {} metrics", count);
-                        }
+                        total_metrics += count;
                     },
                     Err(e) => eprintln!("Error storing metrics: {}", e),
                 }
             }
+
+            _ = status_interval.tick() => {
+                println!("[{}] Status: Total metrics collected: {}",
+                         Utc::now().format("%H:%M:%S"),
+                         total_metrics);
+            },
 
             Some(_) = rediscover_rx.recv() => {
                 println!("Performing periodic interface rediscovery...");
