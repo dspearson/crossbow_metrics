@@ -108,7 +108,7 @@ pub async fn discover_interfaces(
     max_retries: usize,
     verbose: bool,
 ) -> Result<HashMap<String, NetworkInterface>> {
-    let mut interfaces = HashMap::new();
+    let mut interfaces: HashMap<String, NetworkInterface> = HashMap::new();
 
     // Create a mapping between interfaces and zones
     let zone_interface_map = build_zone_interface_map(zones, verbose).await?;
@@ -274,15 +274,15 @@ pub async fn discover_interfaces(
         }
     }
 
-    info!("Discovered {} interfaces", interfaces.len());
+    debug!("Discovered {} interfaces", interfaces.len());
 
     if verbose {
         debug!("Interface details:");
         for (name, interface) in &interfaces {
-            let zone_info = match interface.zone_id {
+            let zone_info = match &interface.zone_id {
                 Some(id) => {
                     let zone_name = zones.iter()
-                                         .find(|&(_, zone_id)| *zone_id == id)
+                                         .find(|&(_, zone_id)| *zone_id == *id)
                                          .map(|(name, _)| name.clone())
                                          .unwrap_or_else(|| "unknown".to_string());
                     format!("zone: {}", zone_name)

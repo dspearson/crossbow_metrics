@@ -16,8 +16,8 @@ async fn main() -> Result<()> {
     // Parse CLI arguments
     let args = Args::parse();
 
-    // Initialize logging
-    initialize_logging(&args);
+    // Initialise logging
+    initialise_logging(&args);
 
     // Load configuration
     let config = AppConfig::load(&args.config)
@@ -62,8 +62,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Initialize the logging system based on command-line arguments
-fn initialize_logging(args: &Args) {
+fn initialise_logging(args: &Args) {
     let level = if args.quiet {
         LogLevel::Error.to_filter()
     } else {
@@ -73,7 +72,7 @@ fn initialize_logging(args: &Args) {
     // Create a default environment and override the log level
     let env = Env::default().default_filter_or(level.to_string());
 
-    // Initialize with custom format
+    // Initialise with custom format
     Builder::from_env(env)
         .format(|buf, record| {
             use std::io::Write;
@@ -91,6 +90,6 @@ fn initialize_logging(args: &Args) {
         })
         .init();
 
-    // Log startup information
+    // Log startup information at debug level instead of info
     debug!("Logging initialized at level: {}", level);
 }

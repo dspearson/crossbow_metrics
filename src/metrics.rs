@@ -189,39 +189,39 @@ async fn rediscover_interfaces(
     // Update tracker and get changes
     let (added, removed) = interface_tracker.update(current_interfaces);
 
-    // Log changes if any
-    if !added.is_empty() {
-        info!("Discovered {} new interfaces", added.len());
-        for name in &added {
-            let interface = interface_tracker.get(name).unwrap();
-            let parent_info = match &interface.parent_interface {
-                Some(parent) => format!(", parent: {}", parent),
-                None => String::new(),
-            };
+    // Log changes if any, but more concisely
+    if !added.is_empty() || !removed.is_empty() {
+        info!("Interface changes: +{} -{}", added.len(), removed.len());
 
-            let zone_info = match &interface.zone_id {
-                Some(zone_id) => {
-                    let unknown = "unknown".to_string();
-                    let zone_name = zones.iter()
-                                         .find_map(|(name, id)| if id == zone_id { Some(name) } else { None })
-                                         .unwrap_or(&unknown);
-                    format!(", zone: {}", zone_name)
-                },
-                None => ", global zone".to_string(),
-            };
+        if verbose {
+            for name in &added {
+                let interface = interface_tracker.get(name).unwrap();
+                let parent_info = match &interface.parent_interface {
+                    Some(parent) => format!(", parent: {}", parent),
+                    None => String::new(),
+                };
 
-            debug!("New interface: {} (type: {}{}{})",
-                   name,
-                   interface.interface_type,
-                   parent_info,
-                   zone_info);
-        }
-    }
+                let zone_info = match &interface.zone_id {
+                    Some(zone_id) => {
+                        let unknown = "unknown".to_string();
+                        let zone_name = zones.iter()
+                                            .find_map(|(name, id)| if id == zone_id { Some(name) } else { None })
+                                            .unwrap_or(&unknown);
+                        format!(", zone: {}", zone_name)
+                    },
+                    None => ", global zone".to_string(),
+                };
 
-    if !removed.is_empty() {
-        info!("Removed {} interfaces", removed.len());
-        for name in &removed {
-            debug!("Removed interface: {}", name);
+                debug!("New interface: {} (type: {}{}{})",
+                    name,
+                    interface.interface_type,
+                    parent_info,
+                    zone_info);
+            }
+
+            for name in &removed {
+                debug!("Removed interface: {}", name);
+            }
         }
     }
 
@@ -520,8 +520,9 @@ async fn process_metrics_batch(
         }
     }
 
+    // Only log at debug level about buffered metrics
     if unknown_count > 0 {
-        debug!("Buffered {} metrics for {} unknown interfaces",
+        trace!("Buffered {} metrics for {} unknown interfaces",
                unknown_count,
                unknown_metrics.keys().collect::<std::collections::HashSet<_>>().len());
     }
