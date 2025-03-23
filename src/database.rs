@@ -23,7 +23,13 @@ pub async fn establish_connection(db_url: &str, sslmode: &str) -> Result<Arc<Cli
             }
         });
 
-        return Ok(Arc::new(client));
+        // Wrap the client in an Arc
+        let client_arc = Arc::new(client);
+
+        // Validate the connection before returning
+        validate_connection(Arc::clone(&client_arc)).await?;
+
+        return Ok(client_arc);
     }
 
     // Set up TLS
@@ -50,7 +56,54 @@ pub async fn establish_connection(db_url: &str, sslmode: &str) -> Result<Arc<Cli
         }
     });
 
-    Ok(Arc::new(client))
+    // Wrap the client in an Arc
+    let client_arc = Arc::new(client);
+
+    // Validate the connection before returning
+    validate_connection(Arc::clone(&client_arc)).await?;
+
+    Ok(client_arc)
+}
+
+// New function to validate a database connection
+pub async fn validate_connection(client: Arc<Client>) -> Result<()> {
+    println!("Validating database connection...");
+
+    // Set a short timeout for the validation query
+    let timeout = Duration::from_secs(10);
+
+    // Run a simple query with timeout
+    match time::timeout(timeout, client.query_one("SELECT 1", &[])).await {
+        Ok(Ok(_)) => {
+            println!("Database connection is valid");
+            Ok(())
+        },
+        Ok(Err(e)) => {
+            Err(anyhow::anyhow!("Database validation failed: {}", e))
+        },
+        Err(_) => {
+            Err(anyhow::anyhow!("Database validation timed out after {} seconds", timeout.as_secs()))
+        }
+    }
+}
+
+// New function to periodically check connection health
+pub async fn start_connection_health_check(client: Arc<Client>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = time::interval(Duration::from_secs(30));
+
+        loop {
+            interval.tick().await;
+            match validate_connection(Arc::clone(&client)).await {
+                Ok(_) => { /* Connection is healthy */ },
+                Err(e) => {
+                    eprintln!("Database connection check failed: {}", e);
+                    // You could potentially set a flag or send a message to a channel here
+                    // to signal to the main process that the connection is unhealthy
+                }
+            }
+        }
+    })
 }
 
 pub async fn execute_with_retry<F, T>(f: F, max_retries: usize) -> Result<T>
