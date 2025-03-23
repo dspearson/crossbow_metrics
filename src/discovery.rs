@@ -258,10 +258,10 @@ pub async fn discover_interfaces(
         };
 
         println!("Interface: {} (type: {}, {}, parent: {:?})",
-            name,
-            interface.interface_type,
-            zone_info,
-            interface.parent_interface
+                 name,
+                 interface.interface_type,
+                 zone_info,
+                 interface.parent_interface.as_deref().unwrap_or("none")
         );
     }
 
