@@ -103,7 +103,9 @@ pub async fn discover_interfaces(
     verbose: bool,
 ) -> Result<HashMap<String, NetworkInterface>> {
     let mut interfaces = HashMap::new();
-    let zone_interface_map: HashMap<String, Uuid> = HashMap::new();
+
+    // Create a mapping between interfaces and zones
+    let zone_interface_map = build_zone_interface_map(zones, verbose).await?;
 
     // Get all datalinks (including physical, etherstub, vnic)
     let output = Command::new("/usr/sbin/dladm")
@@ -227,6 +229,15 @@ pub async fn discover_interfaces(
                 // Get the zone_id for this interface (default to None for global zone)
                 let zone_id = zone_interface_map.get(&interface_name).cloned();
 
+                if verbose && zone_id.is_some() {
+                    // Using a let binding to create a longer-lived value
+                    let unknown = "unknown".to_string();
+                    let zone_name = zones.iter()
+                        .find_map(|(name, id)| if *id == zone_id.unwrap() { Some(name) } else { None })
+                        .unwrap_or(&unknown);
+                    println!("Interface {} belongs to zone {}", interface_name, zone_name);
+                }
+
                 let interface_id = ensure_interface_exists(
                     Arc::clone(&client),
                     host_id,
@@ -273,6 +284,106 @@ pub async fn discover_interfaces(
     }
 
     Ok(interfaces)
+}
+
+// This is a new function to build the mapping between interface names and zone IDs
+async fn build_zone_interface_map(
+    zones: &HashMap<String, Uuid>,
+    verbose: bool,
+) -> Result<HashMap<String, Uuid>> {
+    let mut zone_interface_map = HashMap::new();
+
+    // First, find out which zones are running
+    let output = Command::new("/usr/sbin/zoneadm")
+        .args(&["list", "-p"])
+        .output()
+        .context("Failed to run zoneadm list command")?;
+
+    let zone_output = String::from_utf8(output.stdout)
+        .context("Invalid UTF-8 in zoneadm output")?;
+
+    // Process each running zone (except global) to get its associated VNICs
+    for line in zone_output.lines() {
+        let fields: Vec<&str> = line.split(':').collect();
+        if fields.len() >= 3 {
+            let _zone_id_str = fields[0].to_string(); // Numeric zone ID (not used)
+            let zone_name = fields[1].to_string();
+            let zone_status = fields[2].to_string();
+
+            // Skip if zone is not running or is global
+            if zone_status != "running" || zone_name == "global" {
+                continue;
+            }
+
+            // Get zone UUID from our map
+            if let Some(zone_uuid) = zones.get(&zone_name) {
+                // Get VNICs for this specific zone
+                let vnic_output = Command::new("/usr/sbin/dladm")
+                    .args(&["show-vnic", "-p", "-z", &zone_name, "-o", "link"])
+                    .output()
+                    .context(format!("Failed to run dladm show-vnic for zone {}", zone_name))?;
+
+                let vnic_text = String::from_utf8(vnic_output.stdout)
+                    .context("Invalid UTF-8 in dladm vnic output")?;
+
+                // Map each VNIC to this zone's UUID
+                for vnic_line in vnic_text.lines() {
+                    let vnic_name = vnic_line.trim();
+                    if !vnic_name.is_empty() {
+                        zone_interface_map.insert(vnic_name.to_string(), *zone_uuid);
+                        if verbose {
+                            println!("Associated VNIC {} with zone {}", vnic_name, zone_name);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // If we couldn't get zone info with dladm, try another approach with zonecfg
+    if zone_interface_map.is_empty() {
+        for (zone_name, zone_uuid) in zones {
+            // Skip global zone
+            if zone_name == "global" {
+                continue;
+            }
+
+            // Use zonecfg to get interface info - assuming zone has anet resources configured
+            let zonecfg_output = Command::new("/usr/sbin/zonecfg")
+                .args(&["-z", zone_name, "info", "anet"])
+                .output();
+
+            // Only process if command succeeded
+            if let Ok(output) = zonecfg_output {
+                let anet_text = String::from_utf8_lossy(&output.stdout);
+
+                // Parse the output to extract interface names
+                // Format is typically: name: <vnic_name>
+                for line in anet_text.lines() {
+                    if line.contains("lower-link:") {
+                        // This isn't the interface name, just the parent
+                        continue;
+                    }
+
+                    if line.contains("name:") {
+                        if let Some(vnic_name) = line.split(':').nth(1) {
+                            let vnic_name = vnic_name.trim();
+                            zone_interface_map.insert(vnic_name.to_string(), *zone_uuid);
+                            if verbose {
+                                println!("From zonecfg: Associated VNIC {} with zone {}", vnic_name, zone_name);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if verbose {
+        println!("Built zone-interface map with {} entries", zone_interface_map.len());
+    }
+
+    Ok(zone_interface_map)
 }
 
 pub async fn ensure_interface_exists(
