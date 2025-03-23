@@ -70,7 +70,8 @@ pub async fn collect_metrics(
     max_retries: usize,
     hostname: &str,
 ) -> Result<()> {
-    println!("Starting metrics collection for host {}", hostname);
+    // Log is now in main.rs before calling this function
+    // No need to log it again here
 
     let host_id = database::ensure_host_exists(Arc::clone(&client), hostname, max_retries).await?;
 

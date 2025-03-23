@@ -49,7 +49,6 @@ async fn main() -> Result<()> {
     let _health_check_handle = database::start_connection_health_check(Arc::clone(&client));
 
     // Start the metrics collection loop
-    println!("Starting metrics collection for host {}", hostname);
     metrics::collect_metrics(client, max_retries, &hostname).await?;
 
     Ok(())
