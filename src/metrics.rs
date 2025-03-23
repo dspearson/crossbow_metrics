@@ -73,7 +73,6 @@ pub async fn collect_metrics(
     println!("Starting metrics collection for host {}", hostname);
 
     let host_id = database::ensure_host_exists(Arc::clone(&client), hostname, max_retries).await?;
-    let zones = discovery::discover_zones(Arc::clone(&client), host_id, max_retries).await?;
 
     // Start with an empty interface tracker - no initial discovery
     let mut interface_tracker = InterfaceTracker::new(HashMap::new());
@@ -135,6 +134,7 @@ pub async fn collect_metrics(
 
             },
             Some(_) = rediscover_rx.recv() => {
+                let zones = discovery::discover_zones(Arc::clone(&client), host_id, max_retries).await?;
                 match rediscover_interfaces(
                     Arc::clone(&client),
                     host_id,
