@@ -8,6 +8,116 @@ use std::sync::Arc;
 use tokio_postgres::Client;
 use uuid::Uuid;
 
+// Function to get MAC address and MTU for an interface
+async fn get_interface_details(interface_name: &str) -> Result<(Option<String>, Option<i64>)> {
+    // Default to None for both values in case commands fail
+    let mut mac_address = None;
+    let mut mtu = None;
+
+    // Try to get MAC address using dladm show-phys first
+    trace!("Attempting to get MAC address for {} via dladm show-phys", interface_name);
+    let mac_output = Command::new("/usr/sbin/dladm")
+        .args(&["show-phys", "-p", "-o", "link,address", interface_name])
+        .output();
+
+    if let Ok(output) = mac_output {
+        let mac_text = String::from_utf8_lossy(&output.stdout).to_string();
+        for line in mac_text.lines() {
+            let fields: Vec<&str> = line.split(':').collect();
+            if fields.len() >= 2 && fields[0] == interface_name {
+                // Found a MAC address, format it nicely
+                let raw_mac = fields[1].trim();
+                if !raw_mac.is_empty() && raw_mac != "0" {
+                    mac_address = Some(raw_mac.to_string());
+                    debug!("Found MAC address for {}: {}", interface_name, raw_mac);
+                }
+                break;
+            }
+        }
+    } else {
+        trace!("First MAC address attempt failed, will try alternative method");
+    }
+
+    // Try alternative method if first one didn't work (using show-link instead)
+    if mac_address.is_none() {
+        trace!("Attempting to get MAC address for {} via dladm show-link", interface_name);
+        let alt_mac_output = Command::new("/usr/sbin/dladm")
+            .args(&["show-link", "-p", "-o", "link,address", interface_name])
+            .output();
+
+        if let Ok(output) = alt_mac_output {
+            let mac_text = String::from_utf8_lossy(&output.stdout).to_string();
+            for line in mac_text.lines() {
+                let fields: Vec<&str> = line.split(':').collect();
+                if fields.len() >= 2 && fields[0] == interface_name {
+                    let raw_mac = fields[1].trim();
+                    if !raw_mac.is_empty() && raw_mac != "0" {
+                        mac_address = Some(raw_mac.to_string());
+                        debug!("Found MAC address for {} with alternative method: {}", interface_name, raw_mac);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    // For VNICs, third attempt via show-vnic if needed
+    if mac_address.is_none() {
+        trace!("Attempting to get MAC address for {} via dladm show-vnic", interface_name);
+        let vnic_output = Command::new("/usr/sbin/dladm")
+            .args(&["show-vnic", "-p", "-o", "link,macaddress", interface_name])
+            .output();
+
+        if let Ok(output) = vnic_output {
+            let mac_text = String::from_utf8_lossy(&output.stdout).to_string();
+            for line in mac_text.lines() {
+                let fields: Vec<&str> = line.split(':').collect();
+                if fields.len() >= 2 && fields[0] == interface_name {
+                    let raw_mac = fields[1].trim();
+                    if !raw_mac.is_empty() && raw_mac != "0" {
+                        mac_address = Some(raw_mac.to_string());
+                        debug!("Found MAC address for {} with VNIC method: {}", interface_name, raw_mac);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    if mac_address.is_none() {
+        debug!("Could not determine MAC address for {}", interface_name);
+    }
+
+    // Try to get MTU using dladm show-link
+    trace!("Attempting to get MTU for {}", interface_name);
+    let mtu_output = Command::new("/usr/sbin/dladm")
+        .args(&["show-link", "-p", "-o", "link,mtu", interface_name])
+        .output();
+
+    if let Ok(output) = mtu_output {
+        let mtu_text = String::from_utf8_lossy(&output.stdout).to_string();
+        for line in mtu_text.lines() {
+            let fields: Vec<&str> = line.split(':').collect();
+            if fields.len() >= 2 && fields[0] == interface_name {
+                // Try to parse the MTU value
+                if let Ok(mtu_value) = fields[1].trim().parse::<i64>() {
+                    if mtu_value > 0 {
+                        mtu = Some(mtu_value);
+                        debug!("Found MTU for {}: {}", interface_name, mtu_value);
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    if mtu.is_none() {
+        debug!("Could not determine MTU for {}", interface_name);
+    }
+
+    Ok((mac_address, mtu))
+}
+
 pub async fn discover_zones(client: Arc<Client>, host_id: Uuid, max_retries: usize) -> Result<HashMap<String, Uuid>> {
     let mut zones = HashMap::new();
 
@@ -430,6 +540,10 @@ pub async fn ensure_interface_exists(
     parent_interface: Option<String>,
     max_retries: usize,
 ) -> Result<Uuid> {
+    // Get MAC address and MTU for this interface
+    let (mac_address, mtu) = get_interface_details(&interface_name).await
+        .unwrap_or((None, None));
+
     // Execute with retry logic
     let interface_id = execute_with_retry(move || {
         let client = Arc::clone(&client);
@@ -438,6 +552,8 @@ pub async fn ensure_interface_exists(
         let interface_name = interface_name.clone();
         let interface_type = interface_type.clone();
         let parent_interface = parent_interface.clone();
+        let mac_address = mac_address.clone();
+        let mtu = mtu;
 
         Box::pin(async move {
             let row = client
@@ -458,9 +574,11 @@ pub async fn ensure_interface_exists(
                             "UPDATE interfaces SET
                              interface_type = $1,
                              parent_interface = $2,
+                             mac_address = $3,
+                             mtu = $4,
                              is_active = true
-                             WHERE interface_id = $3",
-                            &[&interface_type, &parent_interface, &interface_id],
+                             WHERE interface_id = $5",
+                            &[&interface_type, &parent_interface, &mac_address, &mtu, &interface_id],
                         )
                         .await
                         .context("Failed to update interface")?;
@@ -470,7 +588,8 @@ pub async fn ensure_interface_exists(
                         None => "global zone".to_string(),
                     };
 
-                    trace!("Updated existing interface record: {} - {} ({})", interface_name, interface_id, zone_desc);
+                    trace!("Updated existing interface record: {} - {} ({}, MAC: {:?}, MTU: {:?})",
+                          interface_name, interface_id, zone_desc, mac_address, mtu);
                     interface_id
                 }
                 None => {
@@ -480,9 +599,11 @@ pub async fn ensure_interface_exists(
                         .execute(
                             "INSERT INTO interfaces (
                              interface_id, host_id, zone_id, interface_name,
-                             interface_type, parent_interface, is_active, created_at
-                            ) VALUES ($1, $2, $3, $4, $5, $6, true, CURRENT_TIMESTAMP)",
-                            &[&interface_id, &host_id, &zone_id, &interface_name, &interface_type, &parent_interface],
+                             interface_type, parent_interface, mac_address, mtu,
+                             is_active, created_at
+                            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true, CURRENT_TIMESTAMP)",
+                            &[&interface_id, &host_id, &zone_id, &interface_name, &interface_type,
+                              &parent_interface, &mac_address, &mtu],
                         )
                         .await
                         .context("Failed to insert interface")?;
@@ -492,7 +613,8 @@ pub async fn ensure_interface_exists(
                         None => "global zone".to_string(),
                     };
 
-                    info!("Created new interface record: {} - {} ({})", interface_name, interface_id, zone_desc);
+                    info!("Created new interface record: {} - {} ({}, MAC: {:?}, MTU: {:?})",
+                         interface_name, interface_id, zone_desc, mac_address, mtu);
                     interface_id
                 }
             };
