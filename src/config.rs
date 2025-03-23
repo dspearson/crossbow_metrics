@@ -84,6 +84,7 @@ pub struct DatabaseConfig {
 pub struct AppConfig {
     pub database: DatabaseConfig,
     pub max_retries: Option<usize>,
+    #[allow(dead_code)]
     pub log_level: Option<String>,
 }
 
@@ -115,9 +116,10 @@ impl AppConfig {
         )
     }
 
+    #[allow(dead_code)]
     pub fn get_log_level(&self) -> LogLevel {
         match &self.log_level {
-            Some(level) => LogLevel::from_str(level).unwrap_or(LogLevel::Info),
+            Some(level) => <LogLevel as FromStr>::from_str(level).unwrap_or(LogLevel::Info),
             None => LogLevel::Info,
         }
     }

@@ -198,11 +198,13 @@ async fn rediscover_interfaces(
                 Some(parent) => format!(", parent: {}", parent),
                 None => String::new(),
             };
+
             let zone_info = match &interface.zone_id {
                 Some(zone_id) => {
+                    let unknown = "unknown".to_string();
                     let zone_name = zones.iter()
-                        .find_map(|(name, id)| if id == zone_id { Some(name) } else { None })
-                        .unwrap_or(&"unknown".to_string());
+                                         .find_map(|(name, id)| if id == zone_id { Some(name) } else { None })
+                                         .unwrap_or(&unknown);
                     format!(", zone: {}", zone_name)
                 },
                 None => ", global zone".to_string(),

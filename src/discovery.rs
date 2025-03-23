@@ -1,7 +1,7 @@
 use crate::database::execute_with_retry;
 use crate::models::NetworkInterface;
 use anyhow::{Context, Error, Result};
-use log::{debug, error, info, trace, warn};
+use log::{debug, info, trace, warn};
 use std::collections::HashMap;
 use std::process::Command;
 use std::sync::Arc;
@@ -247,7 +247,7 @@ pub async fn discover_interfaces(
                     // Using a let binding to create a longer-lived value
                     let unknown = "unknown".to_string();
                     let zone_name = zones.iter()
-                        .find_map(|(name, id)| if id == zone_id.unwrap() { Some(name) } else { None })
+                        .find_map(|(name, id)| if *id == zone_id.unwrap() { Some(name) } else { None })
                         .unwrap_or(&unknown);
                     debug!("Interface {} belongs to zone {}", interface_name, zone_name);
                 }
@@ -411,7 +411,7 @@ async fn build_zone_interface_map(
             let unknown = "unknown".to_string();
 
             let zone_name = zones.iter()
-                .find_map(|(name, id)| if id == zone_uuid { Some(name) } else { None })
+                .find_map(|(name, id)| if *id == *zone_uuid { Some(name) } else { None })
                 .unwrap_or(&unknown);
 
             debug!("Interface {} → Zone {} ({})", interface, zone_name, zone_uuid);

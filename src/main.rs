@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use config::{AppConfig, Args, LogLevel};
 use env_logger::{Builder, Env};
-use log::{debug, error, info, warn};
+use log::{debug, error, info};
 use std::sync::Arc;
 
 #[tokio::main]
@@ -80,13 +80,11 @@ fn initialize_logging(args: &Args) {
             use chrono::Local;
 
             let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
-            let level_style = buf.default_level_style(record.level());
-
             writeln!(
                 buf,
                 "{} {} [{}] {}",
                 timestamp,
-                level_style.value(record.level()),
+                record.level(),
                 record.target(),
                 record.args()
             )
