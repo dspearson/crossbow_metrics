@@ -1,6 +1,6 @@
 use crate::database::execute_with_retry;
 use crate::models::NetworkInterface;
-use anyhow::{Context, Result, Error};
+use anyhow::{Context, Error, Result};
 use log::{debug, info, trace, warn};
 use std::collections::HashMap;
 use std::process::Command;
@@ -40,19 +40,27 @@ async fn get_mac_address(interface_name: &str) -> Result<Option<String>> {
 }
 
 async fn try_get_mac_vnic(interface_name: &str) -> Result<Option<String>> {
-    trace!("Attempting to get MAC address for {} via dladm show-vnic", interface_name);
+    trace!(
+        "Attempting to get MAC address for {} via dladm show-vnic",
+        interface_name
+    );
     let vnic_output = Command::new("/usr/sbin/dladm")
         .args(&["show-vnic", "-p", "-o", "macaddress", interface_name])
         .output();
 
     if let Ok(output) = vnic_output {
         if output.status.success() {
-            let mac_text = String::from_utf8_lossy(&output.stdout).to_string().trim().to_string();
+            let mac_text = String::from_utf8_lossy(&output.stdout)
+                .to_string()
+                .trim()
+                .to_string();
             if !mac_text.is_empty() {
                 let formatted_mac = format_mac_address(&mac_text)?;
                 if !formatted_mac.is_empty() {
-                    debug!("Found MAC address for {} with VNIC method: {}",
-                          interface_name, &formatted_mac);
+                    debug!(
+                        "Found MAC address for {} with VNIC method: {}",
+                        interface_name, &formatted_mac
+                    );
                     return Ok(Some(formatted_mac));
                 }
             }
@@ -65,19 +73,27 @@ async fn try_get_mac_vnic(interface_name: &str) -> Result<Option<String>> {
 }
 
 async fn try_get_mac_phys(interface_name: &str) -> Result<Option<String>> {
-    trace!("Attempting to get MAC address for {} via dladm show-phys", interface_name);
+    trace!(
+        "Attempting to get MAC address for {} via dladm show-phys",
+        interface_name
+    );
     let mac_output = Command::new("/usr/sbin/dladm")
         .args(&["show-phys", "-p", "-o", "macaddress", interface_name])
         .output();
 
     if let Ok(output) = mac_output {
         if output.status.success() {
-            let mac_text = String::from_utf8_lossy(&output.stdout).to_string().trim().to_string();
+            let mac_text = String::from_utf8_lossy(&output.stdout)
+                .to_string()
+                .trim()
+                .to_string();
             if !mac_text.is_empty() {
                 let formatted_mac = format_mac_address(&mac_text)?;
                 if !formatted_mac.is_empty() {
-                    debug!("Found MAC address for {}: {}",
-                          interface_name, &formatted_mac);
+                    debug!(
+                        "Found MAC address for {}: {}",
+                        interface_name, &formatted_mac
+                    );
                     return Ok(Some(formatted_mac));
                 }
             }
@@ -90,19 +106,27 @@ async fn try_get_mac_phys(interface_name: &str) -> Result<Option<String>> {
 }
 
 async fn try_get_mac_link(interface_name: &str) -> Result<Option<String>> {
-    trace!("Attempting to get MAC address for {} via dladm show-link", interface_name);
+    trace!(
+        "Attempting to get MAC address for {} via dladm show-link",
+        interface_name
+    );
     let alt_mac_output = Command::new("/usr/sbin/dladm")
         .args(&["show-link", "-p", "-o", "macaddress", interface_name])
         .output();
 
     if let Ok(output) = alt_mac_output {
         if output.status.success() {
-            let mac_text = String::from_utf8_lossy(&output.stdout).to_string().trim().to_string();
+            let mac_text = String::from_utf8_lossy(&output.stdout)
+                .to_string()
+                .trim()
+                .to_string();
             if !mac_text.is_empty() {
                 let formatted_mac = format_mac_address(&mac_text)?;
                 if !formatted_mac.is_empty() {
-                    debug!("Found MAC address for {} with alternative method: {}",
-                          interface_name, &formatted_mac);
+                    debug!(
+                        "Found MAC address for {} with alternative method: {}",
+                        interface_name, &formatted_mac
+                    );
                     return Ok(Some(formatted_mac));
                 }
             }
@@ -122,7 +146,10 @@ async fn get_interface_mtu(interface_name: &str) -> Result<Option<i64>> {
 
     if let Ok(output) = mtu_output {
         if output.status.success() {
-            let mtu_text = String::from_utf8_lossy(&output.stdout).to_string().trim().to_string();
+            let mtu_text = String::from_utf8_lossy(&output.stdout)
+                .to_string()
+                .trim()
+                .to_string();
             if !mtu_text.is_empty() {
                 if let Ok(mtu_value) = mtu_text.parse::<i64>() {
                     if mtu_value > 0 {
@@ -154,15 +181,20 @@ fn format_mac_address(raw_mac: &str) -> Result<String> {
     if raw_mac.contains("\\:") {
         // Simply remove the escape characters
         let formatted = raw_mac.replace("\\:", ":");
-        debug!("Converted escaped MAC format: {:?} -> {:?}", raw_mac, formatted);
+        debug!(
+            "Converted escaped MAC format: {:?} -> {:?}",
+            raw_mac, formatted
+        );
         return Ok(formatted);
     }
 
     // Remove any backslashes, quotes, or other unwanted characters
-    let cleaned = raw_mac.replace("\\", "")
-                         .replace("\"", "")
-                         .replace("'", "")
-                         .trim().to_string();
+    let cleaned = raw_mac
+        .replace("\\", "")
+        .replace("\"", "")
+        .replace("'", "")
+        .trim()
+        .to_string();
 
     if cleaned.is_empty() {
         return Ok(String::new());
@@ -216,7 +248,11 @@ fn get_standardized_mac_format(mac: &str) -> Option<String> {
     None
 }
 
-pub async fn discover_zones(client: Arc<Client>, host_id: Uuid, max_retries: usize) -> Result<HashMap<String, Uuid>> {
+pub async fn discover_zones(
+    client: Arc<Client>,
+    host_id: Uuid,
+    max_retries: usize,
+) -> Result<HashMap<String, Uuid>> {
     let mut zones = HashMap::new();
 
     // Get zone list from system
@@ -241,8 +277,9 @@ pub async fn discover_zones(client: Arc<Client>, host_id: Uuid, max_retries: usi
                 host_id,
                 &zone_name,
                 zone_status,
-                max_retries
-            ).await?;
+                max_retries,
+            )
+            .await?;
 
             zones.insert(zone_name, zone_id);
         }
@@ -260,8 +297,7 @@ async fn get_zone_list() -> Result<String> {
         .output()
         .context("Failed to run zoneadm command")?;
 
-    String::from_utf8(output.stdout)
-        .context("Invalid UTF-8 in zoneadm output")
+    String::from_utf8(output.stdout).context("Invalid UTF-8 in zoneadm output")
 }
 
 async fn ensure_zone_exists(
@@ -269,7 +305,7 @@ async fn ensure_zone_exists(
     host_id: Uuid,
     zone_name: &str,
     zone_status: Option<String>,
-    max_retries: usize
+    max_retries: usize,
 ) -> Result<Uuid> {
     // Check if zone exists in database with retry logic
     let zone_client = Arc::clone(&client);
@@ -350,21 +386,11 @@ pub async fn discover_interfaces(
     }
 
     // Process interfaces by type to ensure parent interfaces are created first
-    process_physical_interfaces(
-        &mut interfaces,
-        &client,
-        host_id,
-        &link_output,
-        max_retries
-    ).await?;
+    process_physical_interfaces(&mut interfaces, &client, host_id, &link_output, max_retries)
+        .await?;
 
-    process_etherstub_interfaces(
-        &mut interfaces,
-        &client,
-        host_id,
-        &link_output,
-        max_retries
-    ).await?;
+    process_etherstub_interfaces(&mut interfaces, &client, host_id, &link_output, max_retries)
+        .await?;
 
     process_vnic_interfaces(
         &mut interfaces,
@@ -375,8 +401,9 @@ pub async fn discover_interfaces(
         &vnic_parents,
         zones,
         max_retries,
-        verbose
-    ).await?;
+        verbose,
+    )
+    .await?;
 
     debug!("Discovered {} interfaces", interfaces.len());
 
@@ -395,8 +422,7 @@ async fn get_interface_information() -> Result<(String, HashMap<String, String>)
         .output()
         .context("Failed to run dladm show-link command")?;
 
-    let link_output = String::from_utf8(output.stdout)
-        .context("Invalid UTF-8 in dladm output")?;
+    let link_output = String::from_utf8(output.stdout).context("Invalid UTF-8 in dladm output")?;
 
     // Get VNIC parent relationships
     debug!("Retrieving VNIC parent relationships");
@@ -405,8 +431,8 @@ async fn get_interface_information() -> Result<(String, HashMap<String, String>)
         .output()
         .context("Failed to run dladm show-vnic command")?;
 
-    let vnic_output = String::from_utf8(vnic_output.stdout)
-        .context("Invalid UTF-8 in dladm vnic output")?;
+    let vnic_output =
+        String::from_utf8(vnic_output.stdout).context("Invalid UTF-8 in dladm vnic output")?;
 
     // Build a mapping of VNICs to their parent interfaces
     let mut vnic_parents = HashMap::new();
@@ -429,7 +455,10 @@ fn debug_interface_list(link_output: &str) {
         if fields.len() >= 2 {
             let interface_name = fields[0];
             let interface_type = fields[1];
-            trace!("Found interface: {} (type: {})", interface_name, interface_type);
+            trace!(
+                "Found interface: {} (type: {})",
+                interface_name, interface_type
+            );
         }
     }
 }
@@ -439,7 +468,7 @@ async fn process_physical_interfaces(
     client: &Arc<Client>,
     host_id: Uuid,
     link_output: &str,
-    max_retries: usize
+    max_retries: usize,
 ) -> Result<()> {
     debug!("Processing physical interfaces");
     for line in link_output.lines() {
@@ -459,16 +488,20 @@ async fn process_physical_interfaces(
                     interface_type.clone(),
                     None, // No parent for physical interfaces
                     max_retries,
-                ).await?;
+                )
+                .await?;
 
-                interfaces.insert(interface_name.clone(), NetworkInterface {
-                    interface_id,
-                    host_id,
-                    zone_id: None,
-                    interface_name,
-                    interface_type,
-                    parent_interface: None,
-                });
+                interfaces.insert(
+                    interface_name.clone(),
+                    NetworkInterface {
+                        interface_id,
+                        host_id,
+                        zone_id: None,
+                        interface_name,
+                        interface_type,
+                        parent_interface: None,
+                    },
+                );
             }
         }
     }
@@ -481,7 +514,7 @@ async fn process_etherstub_interfaces(
     client: &Arc<Client>,
     host_id: Uuid,
     link_output: &str,
-    max_retries: usize
+    max_retries: usize,
 ) -> Result<()> {
     debug!("Processing etherstub interfaces");
     for line in link_output.lines() {
@@ -501,16 +534,20 @@ async fn process_etherstub_interfaces(
                     interface_type.clone(),
                     None, // No parent for etherstubs
                     max_retries,
-                ).await?;
+                )
+                .await?;
 
-                interfaces.insert(interface_name.clone(), NetworkInterface {
-                    interface_id,
-                    host_id,
-                    zone_id: None,
-                    interface_name,
-                    interface_type,
-                    parent_interface: None,
-                });
+                interfaces.insert(
+                    interface_name.clone(),
+                    NetworkInterface {
+                        interface_id,
+                        host_id,
+                        zone_id: None,
+                        interface_name,
+                        interface_type,
+                        parent_interface: None,
+                    },
+                );
             }
         }
     }
@@ -527,7 +564,7 @@ async fn process_vnic_interfaces(
     vnic_parents: &HashMap<String, String>,
     zones: &HashMap<String, Uuid>,
     max_retries: usize,
-    verbose: bool
+    verbose: bool,
 ) -> Result<()> {
     debug!("Processing VNIC interfaces");
     for line in link_output.lines() {
@@ -539,7 +576,10 @@ async fn process_vnic_interfaces(
             if interface_type == "vnic" {
                 // It's a VNIC - get its parent
                 let parent_interface = vnic_parents.get(&interface_name).cloned();
-                trace!("Processing VNIC interface: {} (parent: {:?})", interface_name, parent_interface);
+                trace!(
+                    "Processing VNIC interface: {} (parent: {:?})",
+                    interface_name, parent_interface
+                );
 
                 // Get the zone_id for this interface (default to None for global zone)
                 let zone_id = zone_interface_map.get(&interface_name).cloned();
@@ -547,8 +587,15 @@ async fn process_vnic_interfaces(
                 if verbose && zone_id.is_some() {
                     // Using a let binding to create a longer-lived value
                     let unknown = "unknown".to_string();
-                    let zone_name = zones.iter()
-                        .find_map(|(name, id)| if *id == zone_id.unwrap() { Some(name) } else { None })
+                    let zone_name = zones
+                        .iter()
+                        .find_map(|(name, id)| {
+                            if *id == zone_id.unwrap() {
+                                Some(name)
+                            } else {
+                                None
+                            }
+                        })
                         .unwrap_or(&unknown);
                     debug!("Interface {} belongs to zone {}", interface_name, zone_name);
                 }
@@ -561,47 +608,25 @@ async fn process_vnic_interfaces(
                     interface_type.clone(),
                     parent_interface.clone(),
                     max_retries,
-                ).await?;
+                )
+                .await?;
 
-                interfaces.insert(interface_name.clone(), NetworkInterface {
-                    interface_id,
-                    host_id,
-                    zone_id,
-                    interface_name,
-                    interface_type,
-                    parent_interface,
-                });
+                interfaces.insert(
+                    interface_name.clone(),
+                    NetworkInterface {
+                        interface_id,
+                        host_id,
+                        zone_id,
+                        interface_name,
+                        interface_type,
+                        parent_interface,
+                    },
+                );
             }
         }
     }
 
     Ok(())
-}
-
-fn log_detailed_interface_info(
-    interfaces: &HashMap<String, NetworkInterface>,
-    zones: &HashMap<String, Uuid>
-) {
-    debug!("Interface details:");
-    for (name, interface) in interfaces {
-        let zone_info = match &interface.zone_id {
-            Some(id) => {
-                let zone_name = zones.iter()
-                                     .find(|&(_, zone_id)| *zone_id == *id)
-                                     .map(|(name, _)| name.clone())
-                                     .unwrap_or_else(|| "unknown".to_string());
-                format!("zone: {}", zone_name)
-            },
-            None => "global zone".to_string(),
-        };
-
-        debug!("Interface: {} (type: {}, {}, parent: {:?})",
-               name,
-               interface.interface_type,
-               zone_info,
-               interface.parent_interface.as_deref().unwrap_or("none")
-        );
-    }
 }
 
 // Function to build the mapping between interface names and zone IDs
@@ -627,7 +652,7 @@ async fn build_zone_interface_map(
 
 async fn build_map_using_zonecfg(
     zones: &HashMap<String, Uuid>,
-    verbose: bool
+    verbose: bool,
 ) -> Result<HashMap<String, Uuid>> {
     let mut interface_map = HashMap::new();
 
@@ -679,7 +704,7 @@ async fn build_map_using_zonecfg(
 
 async fn build_map_using_dladm(
     zones: &HashMap<String, Uuid>,
-    verbose: bool
+    verbose: bool,
 ) -> Result<HashMap<String, Uuid>> {
     let mut zone_interface_map = HashMap::new();
 
@@ -707,7 +732,10 @@ async fn build_map_using_dladm(
 
                 if !zone_name.is_empty() && zone_name != "global" {
                     if let Some(zone_uuid) = zones.get(zone_name) {
-                        info!("Associating interface {} with zone {}", interface_name, zone_name);
+                        info!(
+                            "Associating interface {} with zone {}",
+                            interface_name, zone_name
+                        );
                         zone_interface_map.insert(interface_name.to_string(), *zone_uuid);
                     }
                 }
@@ -720,23 +748,30 @@ async fn build_map_using_dladm(
 
 fn log_zone_interface_mapping(
     zone_interface_map: &HashMap<String, Uuid>,
-    zones: &HashMap<String, Uuid>
+    zones: &HashMap<String, Uuid>,
 ) {
     if zone_interface_map.is_empty() {
         warn!("WARNING: No zone-interface mappings found!");
     } else {
-        info!("Built zone-interface map with {} entries", zone_interface_map.len());
+        info!(
+            "Built zone-interface map with {} entries",
+            zone_interface_map.len()
+        );
 
         for (interface, zone_uuid) in zone_interface_map {
             // Find zone name for the UUID
             // Create a longer-lived string to avoid the borrowing issue
             let unknown = "unknown".to_string();
 
-            let zone_name = zones.iter()
+            let zone_name = zones
+                .iter()
                 .find_map(|(name, id)| if *id == *zone_uuid { Some(name) } else { None })
                 .unwrap_or(&unknown);
 
-            debug!("Interface {} → Zone {} ({})", interface, zone_name, zone_uuid);
+            debug!(
+                "Interface {} → Zone {} ({})",
+                interface, zone_name, zone_uuid
+            );
         }
     }
 }
@@ -752,13 +787,18 @@ pub async fn ensure_interface_exists(
     max_retries: usize,
 ) -> Result<Uuid> {
     // Get MAC address and MTU for this interface
-    let (mac_address, mtu) = get_interface_details(&interface_name).await
+    let (mac_address, mtu) = get_interface_details(&interface_name)
+        .await
         .unwrap_or((None, None));
 
-    debug!("Found details for {}: MAC: {:?}, MTU: {:?}", interface_name, mac_address, mtu);
+    debug!(
+        "Found details for {}: MAC: {:?}, MTU: {:?}",
+        interface_name, mac_address, mtu
+    );
 
     // First check if interface exists
-    let interface_id = get_interface_id(&client, host_id, &interface_name, zone_id, max_retries).await?;
+    let interface_id =
+        get_interface_id(&client, host_id, &interface_name, zone_id, max_retries).await?;
 
     // Check if this is a new interface or existing one
     let is_new = is_new_interface(&client, interface_id, max_retries).await?;
@@ -774,8 +814,9 @@ pub async fn ensure_interface_exists(
             &parent_interface,
             &mac_address,
             mtu,
-            max_retries
-        ).await?;
+            max_retries,
+        )
+        .await?;
     } else {
         update_existing_interface(
             &client,
@@ -786,8 +827,9 @@ pub async fn ensure_interface_exists(
             &mac_address,
             mtu,
             zone_id,
-            max_retries
-        ).await?;
+            max_retries,
+        )
+        .await?;
     }
 
     Ok(interface_id)
@@ -798,7 +840,7 @@ async fn get_interface_id(
     host_id: Uuid,
     interface_name: &str,
     zone_id: Option<Uuid>,
-    max_retries: usize
+    max_retries: usize,
 ) -> Result<Uuid> {
     let client_clone = Arc::clone(client);
     let interface_name_clone = interface_name.to_string();
@@ -834,27 +876,30 @@ async fn get_interface_id(
 async fn is_new_interface(
     client: &Arc<Client>,
     interface_id: Uuid,
-    max_retries: usize
+    max_retries: usize,
 ) -> Result<bool> {
     let client_clone = Arc::clone(client);
     let interface_id_clone = interface_id;
 
-    execute_with_retry(move || {
-        let client = Arc::clone(&client_clone);
-        let interface_id = interface_id_clone;
+    execute_with_retry(
+        move || {
+            let client = Arc::clone(&client_clone);
+            let interface_id = interface_id_clone;
 
-        Box::pin(async move {
-            let row = client
-                .query_opt(
-                    "SELECT 1 FROM interfaces WHERE interface_id = $1",
-                    &[&interface_id],
-                )
-                .await
-                .context("Failed to check if interface exists")?;
+            Box::pin(async move {
+                let row = client
+                    .query_opt(
+                        "SELECT 1 FROM interfaces WHERE interface_id = $1",
+                        &[&interface_id],
+                    )
+                    .await
+                    .context("Failed to check if interface exists")?;
 
-            Ok::<_, Error>(row.is_none())
-        })
-    }, max_retries)
+                Ok::<_, Error>(row.is_none())
+            })
+        },
+        max_retries,
+    )
     .await
 }
 
@@ -868,7 +913,7 @@ async fn create_new_interface(
     parent_interface: &Option<String>,
     mac_address: &Option<String>,
     mtu: Option<i64>,
-    max_retries: usize
+    max_retries: usize,
 ) -> Result<()> {
     // Create new interface
     let client_clone = Arc::clone(client);
@@ -881,31 +926,43 @@ async fn create_new_interface(
     let mac_address_clone = mac_address.clone();
     let mtu_clone = mtu;
 
-    execute_with_retry(move || {
-        let client = Arc::clone(&client_clone);
-        let interface_id = interface_id_clone;
-        let host_id = host_id_clone;
-        let zone_id = zone_id_clone;
-        let interface_name = interface_name_clone.clone();
-        let interface_type = interface_type_clone.clone();
-        let parent_interface = parent_interface_clone.clone();
-        let mac_address = mac_address_clone.clone();
-        let mtu = mtu_clone;
+    execute_with_retry(
+        move || {
+            let client = Arc::clone(&client_clone);
+            let interface_id = interface_id_clone;
+            let host_id = host_id_clone;
+            let zone_id = zone_id_clone;
+            let interface_name = interface_name_clone.clone();
+            let interface_type = interface_type_clone.clone();
+            let parent_interface = parent_interface_clone.clone();
+            let mac_address = mac_address_clone.clone();
+            let mtu = mtu_clone;
 
-        Box::pin(async move {
-            client.execute(
-                "INSERT INTO interfaces (
+            Box::pin(async move {
+                client
+                    .execute(
+                        "INSERT INTO interfaces (
                  interface_id, host_id, zone_id, interface_name,
                  interface_type, parent_interface, mac_address, mtu,
                  is_active, created_at
                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true, CURRENT_TIMESTAMP)",
-                &[&interface_id, &host_id, &zone_id, &interface_name, &interface_type,
-                  &parent_interface, &mac_address, &mtu],
-            )
-            .await
-            .context("Failed to insert interface")
-        })
-    }, max_retries)
+                        &[
+                            &interface_id,
+                            &host_id,
+                            &zone_id,
+                            &interface_name,
+                            &interface_type,
+                            &parent_interface,
+                            &mac_address,
+                            &mtu,
+                        ],
+                    )
+                    .await
+                    .context("Failed to insert interface")
+            })
+        },
+        max_retries,
+    )
     .await?;
 
     // If MAC address is provided, create initial history record
@@ -913,44 +970,28 @@ async fn create_new_interface(
         create_initial_mac_history(client, interface_id, mac, max_retries).await?;
     }
 
+    // Format zone information
     let zone_desc = match &zone_id {
         Some(id) => format!("zone ID: {}", id),
         None => "global zone".to_string(),
     };
 
-    info!("Created new interface record: {} - {} ({}, MAC: {:?}, MTU: {:?})",
-          interface_name, interface_id, zone_desc, mac_address, mtu);
+    // Format MAC address for logging
+    let mac_display = match mac_address {
+        Some(mac) => format!("MAC: {}", mac),
+        None => "no MAC".to_string(),
+    };
 
-    Ok(())
-}
+    // Format MTU for logging
+    let mtu_display = match mtu {
+        Some(mtu_value) => format!("MTU: {}", mtu_value),
+        None => "default MTU".to_string(),
+    };
 
-async fn create_initial_mac_history(
-    client: &Arc<Client>,
-    interface_id: Uuid,
-    mac: &str,
-    max_retries: usize
-) -> Result<()> {
-    let client_clone = Arc::clone(client);
-    let interface_id_clone = interface_id;
-    let mac_clone = mac.to_string();
-
-    execute_with_retry(move || {
-        let client = Arc::clone(&client_clone);
-        let interface_id = interface_id_clone;
-        let mac = mac_clone.clone();
-
-        Box::pin(async move {
-            client.execute(
-                "INSERT INTO mac_address_history
-                 (interface_id, mac_address, effective_from, change_reason)
-                 VALUES ($1, $2, CURRENT_TIMESTAMP, $3)",
-                &[&interface_id, &mac, &"Initial discovery"],
-            )
-            .await
-            .context("Failed to insert initial MAC history record")
-        })
-    }, max_retries)
-    .await?;
+    info!(
+        "Created new interface record: {} - {} ({}, {}, {})",
+        interface_name, interface_id, zone_desc, mac_display, mtu_display
+    );
 
     Ok(())
 }
@@ -964,7 +1005,7 @@ async fn update_existing_interface(
     mac_address: &Option<String>,
     mtu: Option<i64>,
     zone_id: Option<Uuid>,
-    max_retries: usize
+    max_retries: usize,
 ) -> Result<()> {
     // Check current MAC address to see if it changed
     let current_mac = get_current_mac_address(client, interface_id, max_retries).await?;
@@ -973,7 +1014,8 @@ async fn update_existing_interface(
     let mac_changed = is_mac_address_changed(&current_mac, mac_address);
 
     if mac_changed {
-        handle_mac_address_change(client, interface_id, &current_mac, mac_address, max_retries).await?;
+        handle_mac_address_change(client, interface_id, &current_mac, mac_address, max_retries)
+            .await?;
     }
 
     // Update interface details
@@ -984,62 +1026,133 @@ async fn update_existing_interface(
         parent_interface,
         mac_address,
         mtu,
-        max_retries
-    ).await?;
+        max_retries,
+    )
+    .await?;
 
+    // Format zone information
     let zone_desc = match &zone_id {
         Some(id) => format!("zone ID: {}", id),
         None => "global zone".to_string(),
     };
 
+    // Format MAC address for logging
+    let mac_display = match mac_address {
+        Some(mac) => format!("MAC: {}", mac),
+        None => "no MAC".to_string(),
+    };
+
+    // Format MTU for logging
+    let mtu_display = match mtu {
+        Some(mtu_value) => format!("MTU: {}", mtu_value),
+        None => "default MTU".to_string(),
+    };
+
     if mac_changed {
-        info!("Updated interface record with new MAC: {} - {} ({}, MAC: {:?}, MTU: {:?})",
-             interface_name, interface_id, zone_desc, mac_address, mtu);
+        // Format the previous MAC for better logging
+        let old_mac_display = match &current_mac {
+            Some(mac) => format!("{}", mac),
+            None => "none".to_string(),
+        };
+
+        // Format the new MAC
+        let new_mac_display = match mac_address {
+            Some(mac) => format!("{}", mac),
+            None => "none".to_string(),
+        };
+
+        info!(
+            "Updated interface record with MAC change: {} - {} ({}, MAC: {} → {}, {})",
+            interface_name, interface_id, zone_desc, old_mac_display, new_mac_display, mtu_display
+        );
     } else {
-        trace!("Updated existing interface record: {} - {} ({}, MAC: {:?}, MTU: {:?})",
-              interface_name, interface_id, zone_desc, mac_address, mtu);
+        trace!(
+            "Updated existing interface record: {} - {} ({}, {}, {})",
+            interface_name, interface_id, zone_desc, mac_display, mtu_display
+        );
     }
 
     Ok(())
 }
 
-async fn get_current_mac_address(
-    client: &Arc<Client>,
-    interface_id: Uuid,
-    max_retries: usize
-) -> Result<Option<String>> {
-    let client_clone = Arc::clone(client);
-    let interface_id_clone = interface_id;
+pub async fn force_interface_detection(
+    client: Arc<Client>,
+    host_id: Uuid,
+    interface_name: &str,
+    max_retries: usize,
+) -> Result<NetworkInterface> {
+    debug!(
+        "Attempting to force detection of interface: {}",
+        interface_name
+    );
 
-    execute_with_retry(move || {
-        let client = Arc::clone(&client_clone);
-        let interface_id = interface_id_clone;
+    let (interface_type, parent_interface) =
+        determine_interface_type_and_parent(interface_name).await?;
 
-        Box::pin(async move {
-            let row = client
-                .query_opt(
-                    "SELECT mac_address FROM interfaces WHERE interface_id = $1",
-                    &[&interface_id],
-                )
-                .await
-                .context("Failed to query current MAC address")?;
+    // Create the interface record
+    let interface_id = ensure_interface_exists(
+        Arc::clone(&client),
+        host_id,
+        None, // Default to global zone
+        interface_name.to_string(),
+        interface_type.clone(),
+        parent_interface.clone(),
+        max_retries,
+    )
+    .await?;
 
-            // Fix: Properly handle NULL values in the database column
-            let current_mac: Option<Option<String>> = row.map(|r| r.get(0));
-            // Fix: Extract the inner Option correctly
-            let result = current_mac.flatten();
-            
-            Ok::<_, Error>(result)
-        })
-    }, max_retries)
-    .await
+    let interface = NetworkInterface {
+        interface_id,
+        host_id,
+        zone_id: None,
+        interface_name: interface_name.to_string(),
+        interface_type,
+        parent_interface,
+    };
+
+    // Format parent information for logging
+    let parent_display = match &interface.parent_interface {
+        Some(parent) => format!(", parent: {}", parent),
+        None => String::new(),
+    };
+
+    info!(
+        "Created interface record for interface: {} (type: {}{})",
+        interface_name, interface.interface_type, parent_display
+    );
+
+    Ok(interface)
 }
 
-fn is_mac_address_changed(current_mac: &Option<String>, new_mac: &Option<String>) -> bool {
-    match (current_mac, new_mac) {
-        (Some(current), Some(new)) => current != new,
-        (None, Some(_)) => true,
-        _ => false,
+fn log_detailed_interface_info(
+    interfaces: &HashMap<String, NetworkInterface>,
+    zones: &HashMap<String, Uuid>,
+) {
+    debug!("Interface details:");
+    for (name, interface) in interfaces {
+        // Format zone information
+        let zone_info = match &interface.zone_id {
+            Some(id) => {
+                let zone_name = zones
+                    .iter()
+                    .find(|&(_, zone_id)| *zone_id == *id)
+                    .map(|(name, _)| name.clone())
+                    .unwrap_or_else(|| "unknown".to_string());
+                format!("zone: {}", zone_name)
+            }
+            None => "global zone".to_string(),
+        };
+
+        // Format parent information
+        let parent_display = match &interface.parent_interface {
+            Some(parent) => format!("parent: {}", parent),
+            None => "no parent".to_string(),
+        };
+
+        debug!(
+            "Interface: {} (type: {}, {}, {})",
+            name, interface.interface_type, zone_info, parent_display
+        );
     }
 }
 
@@ -1048,13 +1161,22 @@ async fn handle_mac_address_change(
     interface_id: Uuid,
     current_mac: &Option<String>,
     new_mac: &Option<String>,
-    max_retries: usize
+    max_retries: usize,
 ) -> Result<()> {
+    // Format MAC addresses for logging
+    let old_mac_display = match current_mac {
+        Some(mac) => mac.clone(),
+        None => "none".to_string(),
+    };
+
+    let new_mac_display = match new_mac {
+        Some(mac) => mac.clone(),
+        None => "none".to_string(),
+    };
+
     debug!(
-        "MAC address change detected for interface {}: {} -> {:?}",
-        interface_id,
-        current_mac.as_deref().unwrap_or("None"),
-        new_mac.as_deref().unwrap_or("None")
+        "MAC address change detected for interface {}: {} → {}",
+        interface_id, old_mac_display, new_mac_display
     );
 
     // 1. Close previous MAC history record if exists
@@ -1070,32 +1192,114 @@ async fn handle_mac_address_change(
     Ok(())
 }
 
-async fn close_previous_mac_history(
+async fn create_initial_mac_history(
     client: &Arc<Client>,
     interface_id: Uuid,
     mac: &str,
-    max_retries: usize
+    max_retries: usize,
 ) -> Result<()> {
     let client_clone = Arc::clone(client);
     let interface_id_clone = interface_id;
     let mac_clone = mac.to_string();
 
-    execute_with_retry(move || {
-        let client = Arc::clone(&client_clone);
-        let interface_id = interface_id_clone;
-        let mac = mac_clone.clone();
+    execute_with_retry(
+        move || {
+            let client = Arc::clone(&client_clone);
+            let interface_id = interface_id_clone;
+            let mac = mac_clone.clone();
 
-        Box::pin(async move {
-            client.execute(
-                "UPDATE mac_address_history
+            Box::pin(async move {
+                client
+                    .execute(
+                        "INSERT INTO mac_address_history
+                 (interface_id, mac_address, effective_from, change_reason)
+                 VALUES ($1, $2, CURRENT_TIMESTAMP, $3)",
+                        &[&interface_id, &mac, &"Initial discovery"],
+                    )
+                    .await
+                    .context("Failed to insert initial MAC history record")
+            })
+        },
+        max_retries,
+    )
+    .await?;
+
+    Ok(())
+}
+
+async fn get_current_mac_address(
+    client: &Arc<Client>,
+    interface_id: Uuid,
+    max_retries: usize,
+) -> Result<Option<String>> {
+    let client_clone = Arc::clone(client);
+    let interface_id_clone = interface_id;
+
+    execute_with_retry(
+        move || {
+            let client = Arc::clone(&client_clone);
+            let interface_id = interface_id_clone;
+
+            Box::pin(async move {
+                let row = client
+                    .query_opt(
+                        "SELECT mac_address FROM interfaces WHERE interface_id = $1",
+                        &[&interface_id],
+                    )
+                    .await
+                    .context("Failed to query current MAC address")?;
+
+                // Fix: Properly handle NULL values in the database column
+                let current_mac: Option<Option<String>> = row.map(|r| r.get(0));
+                // Fix: Extract the inner Option correctly
+                let result = current_mac.flatten();
+
+                Ok::<_, Error>(result)
+            })
+        },
+        max_retries,
+    )
+    .await
+}
+
+fn is_mac_address_changed(current_mac: &Option<String>, new_mac: &Option<String>) -> bool {
+    match (current_mac, new_mac) {
+        (Some(current), Some(new)) => current != new,
+        (None, Some(_)) => true,
+        _ => false,
+    }
+}
+
+async fn close_previous_mac_history(
+    client: &Arc<Client>,
+    interface_id: Uuid,
+    mac: &str,
+    max_retries: usize,
+) -> Result<()> {
+    let client_clone = Arc::clone(client);
+    let interface_id_clone = interface_id;
+    let mac_clone = mac.to_string();
+
+    execute_with_retry(
+        move || {
+            let client = Arc::clone(&client_clone);
+            let interface_id = interface_id_clone;
+            let mac = mac_clone.clone();
+
+            Box::pin(async move {
+                client
+                    .execute(
+                        "UPDATE mac_address_history
                  SET effective_to = CURRENT_TIMESTAMP
                  WHERE interface_id = $1 AND mac_address = $2 AND effective_to IS NULL",
-                &[&interface_id, &mac],
-            )
-            .await
-            .context("Failed to close previous MAC history record")
-        })
-    }, max_retries)
+                        &[&interface_id, &mac],
+                    )
+                    .await
+                    .context("Failed to close previous MAC history record")
+            })
+        },
+        max_retries,
+    )
     .await?;
 
     Ok(())
@@ -1105,28 +1309,32 @@ async fn create_new_mac_history(
     client: &Arc<Client>,
     interface_id: Uuid,
     new_mac: &str,
-    max_retries: usize
+    max_retries: usize,
 ) -> Result<()> {
     let client_clone = Arc::clone(client);
     let interface_id_clone = interface_id;
     let new_mac_clone = new_mac.to_string();
 
-    execute_with_retry(move || {
-        let client = Arc::clone(&client_clone);
-        let interface_id = interface_id_clone;
-        let new_mac = new_mac_clone.clone();
+    execute_with_retry(
+        move || {
+            let client = Arc::clone(&client_clone);
+            let interface_id = interface_id_clone;
+            let new_mac = new_mac_clone.clone();
 
-        Box::pin(async move {
-            client.execute(
-                "INSERT INTO mac_address_history
+            Box::pin(async move {
+                client
+                    .execute(
+                        "INSERT INTO mac_address_history
                  (interface_id, mac_address, effective_from, change_reason)
                  VALUES ($1, $2, CURRENT_TIMESTAMP, $3)",
-                &[&interface_id, &new_mac, &"Discovery update"],
-            )
-            .await
-            .context("Failed to insert new MAC history record")
-        })
-    }, max_retries)
+                        &[&interface_id, &new_mac, &"Discovery update"],
+                    )
+                    .await
+                    .context("Failed to insert new MAC history record")
+            })
+        },
+        max_retries,
+    )
     .await?;
 
     Ok(())
@@ -1139,7 +1347,7 @@ async fn update_interface_record(
     parent_interface: &Option<String>,
     mac_address: &Option<String>,
     mtu: Option<i64>,
-    max_retries: usize
+    max_retries: usize,
 ) -> Result<()> {
     let client_clone = Arc::clone(client);
     let interface_id_clone = interface_id;
@@ -1148,85 +1356,57 @@ async fn update_interface_record(
     let mac_address_clone = mac_address.clone();
     let mtu_clone = mtu;
 
-    execute_with_retry(move || {
-        let client = Arc::clone(&client_clone);
-        let interface_id = interface_id_clone;
-        let interface_type = interface_type_clone.clone();
-        let parent_interface = parent_interface_clone.clone();
-        let mac_address = mac_address_clone.clone();
-        let mtu = mtu_clone;
+    execute_with_retry(
+        move || {
+            let client = Arc::clone(&client_clone);
+            let interface_id = interface_id_clone;
+            let interface_type = interface_type_clone.clone();
+            let parent_interface = parent_interface_clone.clone();
+            let mac_address = mac_address_clone.clone();
+            let mtu = mtu_clone;
 
-        Box::pin(async move {
-            client.execute(
-                "UPDATE interfaces SET
+            Box::pin(async move {
+                client
+                    .execute(
+                        "UPDATE interfaces SET
                  interface_type = $1,
                  parent_interface = $2,
                  mac_address = $3,
                  mtu = $4,
                  is_active = true
                  WHERE interface_id = $5",
-                &[&interface_type, &parent_interface, &mac_address, &mtu, &interface_id],
-            )
-            .await
-            .context("Failed to update interface")
-        })
-    }, max_retries)
+                        &[
+                            &interface_type,
+                            &parent_interface,
+                            &mac_address,
+                            &mtu,
+                            &interface_id,
+                        ],
+                    )
+                    .await
+                    .context("Failed to update interface")
+            })
+        },
+        max_retries,
+    )
     .await?;
 
     Ok(())
 }
 
-// Function to force detection of a specific interface by querying dladm directly
-pub async fn force_interface_detection(
-    client: Arc<Client>,
-    host_id: Uuid,
+pub async fn determine_interface_type_and_parent(
     interface_name: &str,
-    max_retries: usize,
-) -> Result<NetworkInterface> {
-    debug!("Attempting to force detection of interface: {}", interface_name);
-
-    let (interface_type, parent_interface) = determine_interface_type_and_parent(interface_name).await?;
-
-    // Create the interface record
-    let interface_id = ensure_interface_exists(
-        Arc::clone(&client),
-        host_id,
-        None, // Default to global zone
-        interface_name.to_string(),
-        interface_type.clone(),
-        parent_interface.clone(),
-        max_retries,
-    ).await?;
-
-    let interface = NetworkInterface {
-        interface_id,
-        host_id,
-        zone_id: None,
-        interface_name: interface_name.to_string(),
-        interface_type,
-        parent_interface,
-    };
-
-    info!("Created interface record for interface: {} (type: {}{})",
-         interface_name,
-         interface.interface_type,
-         match &interface.parent_interface {
-             Some(parent) => format!(", parent: {}", parent),
-             None => String::new(),
-         });
-
-    Ok(interface)
-}
-
-pub async fn determine_interface_type_and_parent(interface_name: &str) -> Result<(String, Option<String>)> {
+) -> Result<(String, Option<String>)> {
     // Try to get accurate interface type by querying dladm directly for this specific interface
     let output = Command::new("/usr/sbin/dladm")
         .args(&["show-link", "-p", "-o", "link,class", interface_name])
         .output()
-        .context(format!("Failed to run dladm show-link for {}", interface_name))?;
+        .context(format!(
+            "Failed to run dladm show-link for {}",
+            interface_name
+        ))?;
 
-    let link_output = String::from_utf8(output.stdout)
-        .context("Invalid UTF-8 in dladm output")?;
+    let link_output = String::from_utf8(output.stdout).context("Invalid UTF-8 in dladm output")?;
 
     // Default values
     let mut interface_type = "dev".to_string(); // Default type
@@ -1248,7 +1428,10 @@ pub async fn determine_interface_type_and_parent(interface_name: &str) -> Result
 
     // If dladm didn't find the interface, fall back to guessing based on naming conventions
     if link_output.trim().is_empty() {
-        debug!("Interface {} not found in dladm, using heuristics to determine type", interface_name);
+        debug!(
+            "Interface {} not found in dladm, using heuristics to determine type",
+            interface_name
+        );
         interface_type = guess_interface_type(interface_name);
     }
 
@@ -1259,10 +1442,13 @@ pub async fn get_vnic_parent(interface_name: &str) -> Result<Option<String>> {
     let vnic_output = Command::new("/usr/sbin/dladm")
         .args(&["show-vnic", "-p", "-o", "link,over", interface_name])
         .output()
-        .context(format!("Failed to run dladm show-vnic for {}", interface_name))?;
+        .context(format!(
+            "Failed to run dladm show-vnic for {}",
+            interface_name
+        ))?;
 
-    let vnic_text = String::from_utf8(vnic_output.stdout)
-        .context("Invalid UTF-8 in dladm vnic output")?;
+    let vnic_text =
+        String::from_utf8(vnic_output.stdout).context("Invalid UTF-8 in dladm vnic output")?;
 
     for line in vnic_text.lines() {
         let fields: Vec<&str> = line.split(':').collect();
@@ -1275,23 +1461,24 @@ pub async fn get_vnic_parent(interface_name: &str) -> Result<Option<String>> {
 }
 
 fn guess_interface_type(interface_name: &str) -> String {
-    if interface_name.starts_with("igb") ||
-       interface_name.starts_with("e1000g") ||
-       interface_name.starts_with("bge") ||
-       interface_name.starts_with("ixgbe") {
-        "phys".to_string()  // Physical device
-    } else if interface_name.ends_with("stub") ||
-              interface_name.contains("stub") {
+    if interface_name.starts_with("igb")
+        || interface_name.starts_with("e1000g")
+        || interface_name.starts_with("bge")
+        || interface_name.starts_with("ixgbe")
+    {
+        "phys".to_string() // Physical device
+    } else if interface_name.ends_with("stub") || interface_name.contains("stub") {
         "etherstub".to_string()
-    } else if interface_name.ends_with("0") &&
-              !interface_name.contains("gw") &&
-              !interface_name.starts_with("igb") {
-        "bridge".to_string()  // Likely a bridge (ends with 0)
+    } else if interface_name.ends_with("0")
+        && !interface_name.contains("gw")
+        && !interface_name.starts_with("igb")
+    {
+        "bridge".to_string() // Likely a bridge (ends with 0)
     } else if interface_name.contains("overlay") {
         "overlay".to_string()
     } else if interface_name.contains("gw") {
-        "vnic".to_string()  // Gateway VNICs typically end with gw
+        "vnic".to_string() // Gateway VNICs typically end with gw
     } else {
-        "dev".to_string()  // Default to generic device if we can't determine
+        "dev".to_string() // Default to generic device if we can't determine
     }
 }

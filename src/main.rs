@@ -58,8 +58,8 @@ fn initialise_logging(args: &Args) {
     // Initialise with custom format
     Builder::from_env(env)
         .format(|buf, record| {
-            use std::io::Write;
             use chrono::Local;
+            use std::io::Write;
 
             let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
             writeln!(
@@ -78,8 +78,7 @@ fn initialise_logging(args: &Args) {
 }
 
 fn load_configuration(args: &Args) -> Result<AppConfig> {
-    AppConfig::load(&args.config)
-        .context(format!("Failed to load config from {}", args.config))
+    AppConfig::load(&args.config).context(format!("Failed to load config from {}", args.config))
 }
 
 fn determine_hostname(args: &Args) -> Result<String> {
@@ -99,9 +98,12 @@ async fn connect_to_database(config: &AppConfig) -> Result<Arc<tokio_postgres::C
         Ok(client) => {
             info!("Successfully connected to database");
             Ok(client)
-        },
+        }
         Err(e) => {
-            error!("Critical error: Failed to establish database connection: {}", e);
+            error!(
+                "Critical error: Failed to establish database connection: {}",
+                e
+            );
             error!("Aborting startup since database connection is required");
             Err(e)
         }

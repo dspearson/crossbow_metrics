@@ -4,6 +4,7 @@ use crate::models::{NetworkInterface, NetworkMetric};
 use anyhow::{Context, Result};
 use chrono::Utc;
 use log::{debug, error, info, trace, warn};
+use rand::random;
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
@@ -13,13 +14,12 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_postgres::Client;
 use uuid::Uuid;
-use rand::random;
 
 // Configuration constants for buffer management
-const MAX_BUFFER_AGE_MINUTES: i64 = 10;  // Maximum age of buffered metrics
-const MAX_METRICS_PER_INTERFACE: usize = 100;  // Maximum metrics to buffer per interface
-const MAX_BUFFER_SIZE: usize = 1000;  // Total maximum buffer size across all interfaces
-const INTERFACE_DETECTION_THRESHOLD: usize = 5;  // Minimum metrics to trigger forced detection
+const MAX_BUFFER_AGE_MINUTES: i64 = 10; // Maximum age of buffered metrics
+const MAX_METRICS_PER_INTERFACE: usize = 100; // Maximum metrics to buffer per interface
+const MAX_BUFFER_SIZE: usize = 1000; // Total maximum buffer size across all interfaces
+const INTERFACE_DETECTION_THRESHOLD: usize = 5; // Minimum metrics to trigger forced detection
 
 // Define a struct for the metric message
 #[derive(Debug, Clone)]
@@ -42,7 +42,10 @@ impl InterfaceTracker {
         }
     }
 
-    fn update(&mut self, new_interfaces: HashMap<String, NetworkInterface>) -> (Vec<String>, Vec<String>) {
+    fn update(
+        &mut self,
+        new_interfaces: HashMap<String, NetworkInterface>,
+    ) -> (Vec<String>, Vec<String>) {
         let current_names: HashSet<String> = self.interfaces.keys().cloned().collect();
         let new_names: HashSet<String> = new_interfaces.keys().cloned().collect();
 
@@ -163,10 +166,10 @@ fn update_and_log_status(tracker: &mut StatusTracker) {
     let rate = tracker.period_metrics as f64 / seconds as f64;
 
     if tracker.period_metrics != 0 {
-        info!("Status: {} metrics collected in the last {} seconds (rate: {:.1} metrics/sec)",
-                 tracker.period_metrics,
-                 seconds,
-                 rate);
+        info!(
+            "Status: {} metrics collected in the last {} seconds (rate: {:.1} metrics/sec)",
+            tracker.period_metrics, seconds, rate
+        );
         tracker.last_status_time = now;
         tracker.period_metrics = 0;
     } else {
@@ -180,7 +183,7 @@ async fn handle_interface_rediscovery(
     interface_tracker: &mut InterfaceTracker,
     max_retries: usize,
     unknown_metrics: &mut HashMap<String, Vec<NetworkMetric>>,
-    verbose: bool
+    verbose: bool,
 ) -> Result<()> {
     debug!("Starting interface rediscovery process");
     let zones = discovery::discover_zones(Arc::clone(&client), host_id, max_retries).await?;
@@ -192,17 +195,21 @@ async fn handle_interface_rediscovery(
         interface_tracker,
         max_retries,
         unknown_metrics,
-        verbose
-    ).await {
+        verbose,
+    )
+    .await
+    {
         Ok((new_count, processed_count)) => {
             if new_count > 0 || processed_count > 0 {
-                info!("Discovered {} new interfaces and processed {} buffered metrics",
-                        new_count, processed_count);
+                info!(
+                    "Discovered {} new interfaces and processed {} buffered metrics",
+                    new_count, processed_count
+                );
             } else {
                 debug!("No new interfaces discovered during rediscovery");
             }
             Ok(())
-        },
+        }
         Err(e) => {
             error!("Error during interface rediscovery: {}", e);
             Err(e)
@@ -217,17 +224,13 @@ async fn rediscover_interfaces(
     interface_tracker: &mut InterfaceTracker,
     max_retries: usize,
     unknown_metrics: &mut HashMap<String, Vec<NetworkMetric>>,
-    verbose: bool
+    verbose: bool,
 ) -> Result<(usize, usize)> {
     // Discover current interfaces
     debug!("Discovering current interfaces");
-    let current_interfaces = discovery::discover_interfaces(
-        Arc::clone(&client),
-        host_id,
-        zones,
-        max_retries,
-        verbose
-    ).await?;
+    let current_interfaces =
+        discovery::discover_interfaces(Arc::clone(&client), host_id, zones, max_retries, verbose)
+            .await?;
 
     // Update tracker and get changes
     let (added, removed) = interface_tracker.update(current_interfaces);
@@ -241,8 +244,9 @@ async fn rediscover_interfaces(
         &added,
         interface_tracker,
         unknown_metrics,
-        max_retries
-    ).await?;
+        max_retries,
+    )
+    .await?;
 
     // Handle interfaces with enough buffered metrics to force detection
     processed_count += handle_force_detection_interfaces(
@@ -250,8 +254,9 @@ async fn rediscover_interfaces(
         host_id,
         interface_tracker,
         unknown_metrics,
-        max_retries
-    ).await?;
+        max_retries,
+    )
+    .await?;
 
     // Clean up the buffer to prevent memory leaks
     cleanup_metrics_buffer(unknown_metrics);
@@ -264,7 +269,7 @@ fn log_interface_changes(
     removed: &[String],
     interface_tracker: &InterfaceTracker,
     zones: &HashMap<String, Uuid>,
-    verbose: bool
+    verbose: bool,
 ) {
     if !added.is_empty() || !removed.is_empty() {
         info!("Interface changes: +{} -{}", added.len(), removed.len());
@@ -280,19 +285,21 @@ fn log_interface_changes(
                     let zone_info = match &interface.zone_id {
                         Some(zone_id) => {
                             let unknown = "unknown".to_string();
-                            let zone_name = zones.iter()
-                                              .find_map(|(name, id)| if id == zone_id { Some(name) } else { None })
-                                              .unwrap_or(&unknown);
+                            let zone_name = zones
+                                .iter()
+                                .find_map(
+                                    |(name, id)| if id == zone_id { Some(name) } else { None },
+                                )
+                                .unwrap_or(&unknown);
                             format!(", zone: {}", zone_name)
-                        },
+                        }
                         None => ", global zone".to_string(),
                     };
 
-                    debug!("New interface: {} (type: {}{}{})",
-                        name,
-                        interface.interface_type,
-                        parent_info,
-                        zone_info);
+                    debug!(
+                        "New interface: {} (type: {}{}{})",
+                        name, interface.interface_type, parent_info, zone_info
+                    );
                 }
             }
 
@@ -308,14 +315,17 @@ async fn process_buffered_metrics_for_new_interfaces(
     added: &[String],
     interface_tracker: &InterfaceTracker,
     unknown_metrics: &mut HashMap<String, Vec<NetworkMetric>>,
-    max_retries: usize
+    max_retries: usize,
 ) -> Result<usize> {
     let mut processed_count = 0;
 
     for name in added {
         if let Some(metrics) = unknown_metrics.remove(name) {
             let metrics_len = metrics.len();
-            info!("Processing {} buffered metrics for newly discovered interface {}", metrics_len, name);
+            info!(
+                "Processing {} buffered metrics for newly discovered interface {}",
+                metrics_len, name
+            );
 
             // Store the processed metrics count for this interface
             let mut interface_processed = 0;
@@ -325,20 +335,19 @@ async fn process_buffered_metrics_for_new_interfaces(
                 if let Some(interface) = interface_tracker.get(name) {
                     let interface_id = interface.interface_id;
 
-                    if let Ok(_) = store_metric(
-                        Arc::clone(client),
-                        interface_id,
-                        &metric,
-                        max_retries
-                    ).await {
+                    if let Ok(_) =
+                        store_metric(Arc::clone(client), interface_id, &metric, max_retries).await
+                    {
                         processed_count += 1;
                         interface_processed += 1;
                     }
                 }
             }
 
-            debug!("Processed {}/{} buffered metrics for interface {}",
-                   interface_processed, metrics_len, name);
+            debug!(
+                "Processed {}/{} buffered metrics for interface {}",
+                interface_processed, metrics_len, name
+            );
         }
     }
 
@@ -350,29 +359,37 @@ async fn handle_force_detection_interfaces(
     host_id: Uuid,
     interface_tracker: &mut InterfaceTracker,
     unknown_metrics: &mut HashMap<String, Vec<NetworkMetric>>,
-    max_retries: usize
+    max_retries: usize,
 ) -> Result<usize> {
     let mut processed_count = 0;
 
     // Identify interfaces with enough buffered metrics to warrant forced detection
-    let interfaces_to_force = unknown_metrics.iter()
+    let interfaces_to_force = unknown_metrics
+        .iter()
         .filter(|(_, metrics)| metrics.len() >= INTERFACE_DETECTION_THRESHOLD)
         .map(|(name, _)| name.clone())
         .collect::<Vec<_>>();
 
     for interface_name in interfaces_to_force {
         if interface_tracker.get(&interface_name).is_none() {
-            info!("Forcing detection for unknown interface with {} buffered metrics: {}",
-                  unknown_metrics.get(&interface_name).map(|m| m.len()).unwrap_or(0),
-                  interface_name);
+            info!(
+                "Forcing detection for unknown interface with {} buffered metrics: {}",
+                unknown_metrics
+                    .get(&interface_name)
+                    .map(|m| m.len())
+                    .unwrap_or(0),
+                interface_name
+            );
 
             // Try to detect this specific interface explicitly
             if let Ok(interface) = discovery::force_interface_detection(
                 Arc::clone(&client),
                 host_id,
                 &interface_name,
-                max_retries
-            ).await {
+                max_retries,
+            )
+            .await
+            {
                 // Update the tracker with the new interface
                 let mut updated_interfaces = interface_tracker.get_all().clone();
                 updated_interfaces.insert(interface_name.clone(), interface);
@@ -393,21 +410,27 @@ async fn handle_force_detection_interfaces(
                                     Arc::clone(&client),
                                     interface_id,
                                     &metric,
-                                    max_retries
-                                ).await {
+                                    max_retries,
+                                )
+                                .await
+                                {
                                     processed_count += 1;
                                     interface_processed += 1;
                                 }
                             }
                         }
 
-                        debug!("Processed {}/{} buffered metrics for newly detected interface {}",
-                               interface_processed, metrics_len, interface_name);
+                        debug!(
+                            "Processed {}/{} buffered metrics for newly detected interface {}",
+                            interface_processed, metrics_len, interface_name
+                        );
                     }
                 }
             } else {
-                debug!("Failed to force detection for interface {}, metrics will remain buffered",
-                      interface_name);
+                debug!(
+                    "Failed to force detection for interface {}, metrics will remain buffered",
+                    interface_name
+                );
             }
         }
     }
@@ -425,8 +448,10 @@ fn cleanup_metrics_buffer(unknown_metrics: &mut HashMap<String, Vec<NetworkMetri
         let removed = original_len - metrics.len();
 
         if removed > 0 {
-            debug!("Dropped {} old buffered metrics for unknown interface {}",
-                  removed, interface_name);
+            debug!(
+                "Dropped {} old buffered metrics for unknown interface {}",
+                removed, interface_name
+            );
         }
 
         // 2. Size-based cleanup - limit metrics per interface
@@ -436,8 +461,10 @@ fn cleanup_metrics_buffer(unknown_metrics: &mut HashMap<String, Vec<NetworkMetri
             let truncated = metrics.len() - MAX_METRICS_PER_INTERFACE;
             metrics.truncate(MAX_METRICS_PER_INTERFACE);
 
-            debug!("Truncated {} excess buffered metrics for interface {}",
-                  truncated, interface_name);
+            debug!(
+                "Truncated {} excess buffered metrics for interface {}",
+                truncated, interface_name
+            );
         }
     }
 
@@ -447,8 +474,10 @@ fn cleanup_metrics_buffer(unknown_metrics: &mut HashMap<String, Vec<NetworkMetri
     // 4. Global buffer size limit - if we exceed MAX_BUFFER_SIZE, drop oldest metrics
     let total_buffered = unknown_metrics.values().map(|v| v.len()).sum::<usize>();
     if total_buffered > MAX_BUFFER_SIZE {
-        info!("Buffer size ({}) exceeds maximum ({}), trimming oldest metrics",
-              total_buffered, MAX_BUFFER_SIZE);
+        info!(
+            "Buffer size ({}) exceeds maximum ({}), trimming oldest metrics",
+            total_buffered, MAX_BUFFER_SIZE
+        );
 
         // Flatten all metrics into one vector with interface name
         let mut all_metrics = Vec::new();
@@ -498,8 +527,10 @@ async fn process_metrics_batch(
                 Arc::clone(&client),
                 interface.interface_id,
                 &metric,
-                max_retries
-            ).await {
+                max_retries,
+            )
+            .await
+            {
                 stored_count += 1;
             }
         } else {
@@ -515,9 +546,14 @@ async fn process_metrics_batch(
 
     // Only log at debug level about buffered metrics
     if unknown_count > 0 {
-        trace!("Buffered {} metrics for {} unknown interfaces",
-               unknown_count,
-               unknown_metrics.keys().collect::<std::collections::HashSet<_>>().len());
+        trace!(
+            "Buffered {} metrics for {} unknown interfaces",
+            unknown_count,
+            unknown_metrics
+                .keys()
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+        );
     }
 
     Ok(stored_count)
@@ -528,38 +564,41 @@ async fn store_metric(
     client: Arc<Client>,
     interface_id: Uuid,
     metric: &NetworkMetric,
-    max_retries: usize
+    max_retries: usize,
 ) -> Result<()> {
-    execute_with_retry(move || {
-        let client = Arc::clone(&client);
-        let timestamp = metric.timestamp;
-        let input_bytes = metric.input_bytes;
-        let input_packets = metric.input_packets;
-        let output_bytes = metric.output_bytes;
-        let output_packets = metric.output_packets;
+    execute_with_retry(
+        move || {
+            let client = Arc::clone(&client);
+            let timestamp = metric.timestamp;
+            let input_bytes = metric.input_bytes;
+            let input_packets = metric.input_packets;
+            let output_bytes = metric.output_bytes;
+            let output_packets = metric.output_packets;
 
-        Box::pin(async move {
-            client
-                .execute(
-                    "INSERT INTO netmetrics (
+            Box::pin(async move {
+                client
+                    .execute(
+                        "INSERT INTO netmetrics (
                     interface_id, timestamp,
                     input_bytes, input_packets, output_bytes, output_packets,
                     collection_method
                     ) VALUES ($1, $2, $3, $4, $5, $6, $7)",
-                    &[
-                        &interface_id,
-                        &timestamp,
-                        &input_bytes,
-                        &input_packets,
-                        &output_bytes,
-                        &output_packets,
-                        &"dlstat",
-                    ],
-                )
-                .await
-                .context("Failed to insert metrics")
-        })
-    }, max_retries)
+                        &[
+                            &interface_id,
+                            &timestamp,
+                            &input_bytes,
+                            &input_packets,
+                            &output_bytes,
+                            &output_packets,
+                            &"dlstat",
+                        ],
+                    )
+                    .await
+                    .context("Failed to insert metrics")
+            })
+        },
+        max_retries,
+    )
     .await?;
 
     Ok(())
@@ -587,7 +626,7 @@ fn continuous_dlstat_collection(tx: mpsc::Sender<MetricMessage>) -> Result<()> {
     // Start dlstat with interval mode
     debug!("Starting dlstat process with interval mode");
     let mut child = Command::new("/usr/sbin/dlstat")
-        .args(&["-i", "1"])  // 1 second interval
+        .args(&["-i", "1"]) // 1 second interval
         .stdout(Stdio::piped())
         .spawn()
         .context("Failed to run dlstat -i command")?;
@@ -702,14 +741,16 @@ fn parse_metric_value(value_str: &str) -> Result<i64> {
     // Parse the numeric part
     match value_str.parse::<f64>() {
         Ok(value) => Ok((value * multiplier as f64) as i64),
-        Err(_) => Err(anyhow::anyhow!("Failed to parse value: {}", value_str))
+        Err(_) => Err(anyhow::anyhow!("Failed to parse value: {}", value_str)),
     }
 }
 
 // Helper function for database operations with retries
 pub async fn execute_with_retry<F, T, E>(f: F, max_retries: usize) -> Result<T>
 where
-    F: Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, E>> + Send>> + Send + Sync,
+    F: Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, E>> + Send>>
+        + Send
+        + Sync,
     E: std::fmt::Display + Into<anyhow::Error>,
 {
     let mut retries = 0;
@@ -725,13 +766,15 @@ where
                 }
 
                 // Log the error and retry
-                warn!("Database operation failed (retry {}/{}): {}", retries, max_retries, e);
+                warn!(
+                    "Database operation failed (retry {}/{}): {}",
+                    retries, max_retries, e
+                );
                 tokio::time::sleep(delay).await;
 
                 // Exponential backoff with jitter
                 delay = Duration::from_millis(
-                    (delay.as_millis() as f64 * 1.5) as u64 +
-                    random::<u64>() % 100
+                    (delay.as_millis() as f64 * 1.5) as u64 + random::<u64>() % 100,
                 );
             }
         }

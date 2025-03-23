@@ -69,14 +69,12 @@ fn build_tls_connector() -> Result<TlsConnector> {
     // uncomment the following line:
     // let tls_builder = tls_builder.danger_accept_invalid_certs(true);
 
-    tls_builder
-        .build()
-        .context("Failed to build TLS connector")
+    tls_builder.build().context("Failed to build TLS connector")
 }
 
 fn spawn_connection_handler<T>(connection: T)
 where
-    T: Future<Output = Result<(), tokio_postgres::Error>> + Send + 'static
+    T: Future<Output = Result<(), tokio_postgres::Error>> + Send + 'static,
 {
     tokio::spawn(async move {
         if let Err(e) = connection.await {
@@ -97,14 +95,20 @@ pub async fn validate_connection(client: Arc<Client>) -> Result<()> {
         Ok(Ok(_)) => {
             debug!("Database connection is valid");
             Ok(())
-        },
+        }
         Ok(Err(e)) => {
             error!("Database validation failed: {}", e);
             Err(anyhow::anyhow!("Database validation failed: {}", e))
-        },
+        }
         Err(_) => {
-            error!("Database validation timed out after {} seconds", timeout.as_secs());
-            Err(anyhow::anyhow!("Database validation timed out after {} seconds", timeout.as_secs()))
+            error!(
+                "Database validation timed out after {} seconds",
+                timeout.as_secs()
+            );
+            Err(anyhow::anyhow!(
+                "Database validation timed out after {} seconds",
+                timeout.as_secs()
+            ))
         }
     }
 }
@@ -120,7 +124,7 @@ pub async fn start_connection_health_check(client: Arc<Client>) -> tokio::task::
             match validate_connection(Arc::clone(&client)).await {
                 Ok(_) => {
                     trace!("Database connection health check passed");
-                },
+                }
                 Err(e) => {
                     warn!("Database connection health check failed: {}", e);
                     // You could potentially set a flag or send a message to a channel here
@@ -148,7 +152,10 @@ where
                 }
 
                 // Log the error and retry
-                warn!("Database operation failed (retry {}/{}): {}", retries, max_retries, e);
+                warn!(
+                    "Database operation failed (retry {}/{}): {}",
+                    retries, max_retries, e
+                );
                 time::sleep(delay).await;
 
                 // Exponential backoff with jitter
@@ -159,24 +166,26 @@ where
 }
 
 fn calculate_backoff_with_jitter(current_delay: Duration) -> Duration {
-    Duration::from_millis(
-        (current_delay.as_millis() as f64 * 1.5) as u64 +
-        random::<u64>() % 100
-    )
+    Duration::from_millis((current_delay.as_millis() as f64 * 1.5) as u64 + random::<u64>() % 100)
 }
 
-pub async fn ensure_host_exists(client: Arc<Client>, hostname: &str, max_retries: usize) -> Result<Uuid> {
+pub async fn ensure_host_exists(
+    client: Arc<Client>,
+    hostname: &str,
+    max_retries: usize,
+) -> Result<Uuid> {
     // Check if host exists
     let hostname = hostname.to_string(); // Clone to avoid reference issues
 
-    execute_with_retry(move || {
-        let client = Arc::clone(&client);
-        let hostname = hostname.clone();
+    execute_with_retry(
+        move || {
+            let client = Arc::clone(&client);
+            let hostname = hostname.clone();
 
-        Box::pin(async move {
-            find_or_create_host(&client, &hostname).await
-        })
-    }, max_retries)
+            Box::pin(async move { find_or_create_host(&client, &hostname).await })
+        },
+        max_retries,
+    )
     .await
 }
 
@@ -195,7 +204,7 @@ async fn find_or_create_host(client: &Client, hostname: &str) -> Result<Uuid> {
             debug!("Found existing host record: {}", host_id);
             Ok(host_id)
         }
-        None => create_new_host(client, hostname).await
+        None => create_new_host(client, hostname).await,
     }
 }
 

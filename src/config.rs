@@ -99,7 +99,9 @@ impl AppConfig {
 
     pub fn get_connection_string(&self) -> String {
         // Join multiple hosts with commas
-        let hosts_with_ports: Vec<String> = self.database.hosts
+        let hosts_with_ports: Vec<String> = self
+            .database
+            .hosts
             .iter()
             .map(|host| format!("{}:{}", host, self.database.port))
             .collect();
@@ -109,10 +111,7 @@ impl AppConfig {
         // The sslmode will be handled separately in the code
         format!(
             "postgresql://{}:{}@{}/{}",
-            self.database.username,
-            self.database.password,
-            hosts,
-            self.database.database
+            self.database.username, self.database.password, hosts, self.database.database
         )
     }
 
