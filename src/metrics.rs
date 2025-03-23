@@ -84,23 +84,14 @@ pub async fn collect_metrics(
     info!("Starting continuous metrics collection");
     let mut metrics_rx = start_continuous_metrics_collection().await?;
 
-    // Create a channel for periodic interface rediscovery
+    // Create channels for communication
     let (rediscover_tx, mut rediscover_rx) = tokio::sync::mpsc::channel::<()>(1);
 
     // Trigger an immediate but non-blocking rediscovery to find interfaces in background
-    debug!("Triggering initial interface discovery");
-    tokio::spawn(async move {
-        if let Err(e) = rediscover_tx.send(()).await {
-            error!("Failed to send rediscovery signal: {}", e);
-        }
-    });
+    trigger_initial_discovery(rediscover_tx.clone()).await;
 
-    // Create the status interval BEFORE the loop
-    let mut status_interval = tokio::time::interval(Duration::from_secs(30));
-
-    // Track period metrics only
-    let mut period_metrics = 0;
-    let mut last_status_time = Utc::now();
+    // Setup status tracking
+    let mut status_tracker = setup_status_tracking();
 
     info!("Entering main collection loop");
     loop {
@@ -114,57 +105,109 @@ pub async fn collect_metrics(
                     &mut unknown_metrics
                 ).await {
                     Ok(count) => {
-                        period_metrics += count;
+                        status_tracker.period_metrics += count;
                         trace!("Processed {} metrics in this batch", count);
                     },
                     Err(e) => error!("Error storing metrics: {}", e),
                 }
             },
 
-            _ = status_interval.tick() => {
-                let now = Utc::now();
-                let seconds = (now - last_status_time).num_seconds().max(1); // Avoid division by zero
-                let rate = period_metrics as f64 / seconds as f64;
-
-                if period_metrics != 0 {
-                    info!("Status: {} metrics collected in the last {} seconds (rate: {:.1} metrics/sec)",
-                             period_metrics,
-                             seconds,
-                             rate);
-                    last_status_time = now;
-                    period_metrics = 0;
-                } else {
-                    debug!("No metrics collected in the last {} seconds", seconds);
-                }
+            _ = status_tracker.interval.tick() => {
+                update_and_log_status(&mut status_tracker);
             },
+
             Some(_) = rediscover_rx.recv() => {
-                debug!("Starting interface rediscovery process");
-                let zones = discovery::discover_zones(Arc::clone(&client), host_id, max_retries).await?;
-                match rediscover_interfaces(
+                handle_interface_rediscovery(
                     Arc::clone(&client),
                     host_id,
-                    &zones,
                     &mut interface_tracker,
                     max_retries,
                     &mut unknown_metrics,
                     verbose
-                ).await {
-                    Ok((new_count, processed_count)) => {
-                        if new_count > 0 || processed_count > 0 {
-                            info!("Discovered {} new interfaces and processed {} buffered metrics",
-                                    new_count, processed_count);
-                        } else {
-                            debug!("No new interfaces discovered during rediscovery");
-                        }
-                    },
-                    Err(e) => error!("Error during interface rediscovery: {}", e),
-                }
+                ).await?;
             },
+
             else => break,
         }
     }
 
     Ok(())
+}
+
+async fn trigger_initial_discovery(rediscover_tx: mpsc::Sender<()>) {
+    debug!("Triggering initial interface discovery");
+    tokio::spawn(async move {
+        if let Err(e) = rediscover_tx.send(()).await {
+            error!("Failed to send rediscovery signal: {}", e);
+        }
+    });
+}
+
+struct StatusTracker {
+    interval: tokio::time::Interval,
+    period_metrics: usize,
+    last_status_time: chrono::DateTime<Utc>,
+}
+
+fn setup_status_tracking() -> StatusTracker {
+    StatusTracker {
+        interval: tokio::time::interval(Duration::from_secs(30)),
+        period_metrics: 0,
+        last_status_time: Utc::now(),
+    }
+}
+
+fn update_and_log_status(tracker: &mut StatusTracker) {
+    let now = Utc::now();
+    let seconds = (now - tracker.last_status_time).num_seconds().max(1); // Avoid division by zero
+    let rate = tracker.period_metrics as f64 / seconds as f64;
+
+    if tracker.period_metrics != 0 {
+        info!("Status: {} metrics collected in the last {} seconds (rate: {:.1} metrics/sec)",
+                 tracker.period_metrics,
+                 seconds,
+                 rate);
+        tracker.last_status_time = now;
+        tracker.period_metrics = 0;
+    } else {
+        debug!("No metrics collected in the last {} seconds", seconds);
+    }
+}
+
+async fn handle_interface_rediscovery(
+    client: Arc<Client>,
+    host_id: Uuid,
+    interface_tracker: &mut InterfaceTracker,
+    max_retries: usize,
+    unknown_metrics: &mut HashMap<String, Vec<NetworkMetric>>,
+    verbose: bool
+) -> Result<()> {
+    debug!("Starting interface rediscovery process");
+    let zones = discovery::discover_zones(Arc::clone(&client), host_id, max_retries).await?;
+
+    match rediscover_interfaces(
+        Arc::clone(&client),
+        host_id,
+        &zones,
+        interface_tracker,
+        max_retries,
+        unknown_metrics,
+        verbose
+    ).await {
+        Ok((new_count, processed_count)) => {
+            if new_count > 0 || processed_count > 0 {
+                info!("Discovered {} new interfaces and processed {} buffered metrics",
+                        new_count, processed_count);
+            } else {
+                debug!("No new interfaces discovered during rediscovery");
+            }
+            Ok(())
+        },
+        Err(e) => {
+            error!("Error during interface rediscovery: {}", e);
+            Err(e)
+        }
+    }
 }
 
 async fn rediscover_interfaces(
@@ -189,47 +232,87 @@ async fn rediscover_interfaces(
     // Update tracker and get changes
     let (added, removed) = interface_tracker.update(current_interfaces);
 
-    // Log changes if any, but more concisely
+    // Log any interface changes
+    log_interface_changes(&added, &removed, interface_tracker, zones, verbose);
+
+    // Process buffered metrics for newly discovered interfaces
+    let mut processed_count = process_buffered_metrics_for_new_interfaces(
+        &client,
+        &added,
+        interface_tracker,
+        unknown_metrics,
+        max_retries
+    ).await?;
+
+    // Handle interfaces with enough buffered metrics to force detection
+    processed_count += handle_force_detection_interfaces(
+        client,
+        host_id,
+        interface_tracker,
+        unknown_metrics,
+        max_retries
+    ).await?;
+
+    // Clean up the buffer to prevent memory leaks
+    cleanup_metrics_buffer(unknown_metrics);
+
+    Ok((added.len(), processed_count))
+}
+
+fn log_interface_changes(
+    added: &[String],
+    removed: &[String],
+    interface_tracker: &InterfaceTracker,
+    zones: &HashMap<String, Uuid>,
+    verbose: bool
+) {
     if !added.is_empty() || !removed.is_empty() {
         info!("Interface changes: +{} -{}", added.len(), removed.len());
 
         if verbose {
-            for name in &added {
-                let interface = interface_tracker.get(name).unwrap();
-                let parent_info = match &interface.parent_interface {
-                    Some(parent) => format!(", parent: {}", parent),
-                    None => String::new(),
-                };
+            for name in added {
+                if let Some(interface) = interface_tracker.get(name) {
+                    let parent_info = match &interface.parent_interface {
+                        Some(parent) => format!(", parent: {}", parent),
+                        None => String::new(),
+                    };
 
-                let zone_info = match &interface.zone_id {
-                    Some(zone_id) => {
-                        let unknown = "unknown".to_string();
-                        let zone_name = zones.iter()
-                                            .find_map(|(name, id)| if id == zone_id { Some(name) } else { None })
-                                            .unwrap_or(&unknown);
-                        format!(", zone: {}", zone_name)
-                    },
-                    None => ", global zone".to_string(),
-                };
+                    let zone_info = match &interface.zone_id {
+                        Some(zone_id) => {
+                            let unknown = "unknown".to_string();
+                            let zone_name = zones.iter()
+                                              .find_map(|(name, id)| if id == zone_id { Some(name) } else { None })
+                                              .unwrap_or(&unknown);
+                            format!(", zone: {}", zone_name)
+                        },
+                        None => ", global zone".to_string(),
+                    };
 
-                debug!("New interface: {} (type: {}{}{})",
-                    name,
-                    interface.interface_type,
-                    parent_info,
-                    zone_info);
+                    debug!("New interface: {} (type: {}{}{})",
+                        name,
+                        interface.interface_type,
+                        parent_info,
+                        zone_info);
+                }
             }
 
-            for name in &removed {
+            for name in removed {
                 debug!("Removed interface: {}", name);
             }
         }
     }
+}
 
-    // Count how many new interfaces discovered and metrics processed
+async fn process_buffered_metrics_for_new_interfaces(
+    client: &Arc<Client>,
+    added: &[String],
+    interface_tracker: &InterfaceTracker,
+    unknown_metrics: &mut HashMap<String, Vec<NetworkMetric>>,
+    max_retries: usize
+) -> Result<usize> {
     let mut processed_count = 0;
 
-    // Process buffered metrics for newly discovered interfaces
-    for name in &added {
+    for name in added {
         if let Some(metrics) = unknown_metrics.remove(name) {
             let metrics_len = metrics.len();
             info!("Processing {} buffered metrics for newly discovered interface {}", metrics_len, name);
@@ -239,16 +322,18 @@ async fn rediscover_interfaces(
 
             // Process each buffered metric
             for metric in metrics {
-                let interface_id = interface_tracker.get(name).unwrap().interface_id;
+                if let Some(interface) = interface_tracker.get(name) {
+                    let interface_id = interface.interface_id;
 
-                if let Ok(_) = store_metric(
-                    Arc::clone(&client),
-                    interface_id,
-                    &metric,
-                    max_retries
-                ).await {
-                    processed_count += 1;
-                    interface_processed += 1;
+                    if let Ok(_) = store_metric(
+                        Arc::clone(client),
+                        interface_id,
+                        &metric,
+                        max_retries
+                    ).await {
+                        processed_count += 1;
+                        interface_processed += 1;
+                    }
                 }
             }
 
@@ -257,7 +342,19 @@ async fn rediscover_interfaces(
         }
     }
 
-    // Force detection for interfaces with enough buffered metrics
+    Ok(processed_count)
+}
+
+async fn handle_force_detection_interfaces(
+    client: Arc<Client>,
+    host_id: Uuid,
+    interface_tracker: &mut InterfaceTracker,
+    unknown_metrics: &mut HashMap<String, Vec<NetworkMetric>>,
+    max_retries: usize
+) -> Result<usize> {
+    let mut processed_count = 0;
+
+    // Identify interfaces with enough buffered metrics to warrant forced detection
     let interfaces_to_force = unknown_metrics.iter()
         .filter(|(_, metrics)| metrics.len() >= INTERFACE_DETECTION_THRESHOLD)
         .map(|(name, _)| name.clone())
@@ -269,7 +366,7 @@ async fn rediscover_interfaces(
                   unknown_metrics.get(&interface_name).map(|m| m.len()).unwrap_or(0),
                   interface_name);
 
-            // Try to detect this specific interface explicitly by querying dladm
+            // Try to detect this specific interface explicitly
             if let Ok(interface) = force_interface_detection(
                 Arc::clone(&client),
                 host_id,
@@ -289,16 +386,18 @@ async fn rediscover_interfaces(
                         let metrics_len = metrics.len();
 
                         for metric in metrics {
-                            let interface_id = interface_tracker.get(&interface_name).unwrap().interface_id;
+                            if let Some(interface) = interface_tracker.get(&interface_name) {
+                                let interface_id = interface.interface_id;
 
-                            if let Ok(_) = store_metric(
-                                Arc::clone(&client),
-                                interface_id,
-                                &metric,
-                                max_retries
-                            ).await {
-                                processed_count += 1;
-                                interface_processed += 1;
+                                if let Ok(_) = store_metric(
+                                    Arc::clone(&client),
+                                    interface_id,
+                                    &metric,
+                                    max_retries
+                                ).await {
+                                    processed_count += 1;
+                                    interface_processed += 1;
+                                }
                             }
                         }
 
@@ -313,8 +412,10 @@ async fn rediscover_interfaces(
         }
     }
 
-    // Clean up buffer to prevent memory leaks:
+    Ok(processed_count)
+}
 
+fn cleanup_metrics_buffer(unknown_metrics: &mut HashMap<String, Vec<NetworkMetric>>) {
     // 1. Age-based cleanup - remove metrics older than MAX_BUFFER_AGE_MINUTES
     let cutoff_time = Utc::now() - chrono::Duration::minutes(MAX_BUFFER_AGE_MINUTES);
 
@@ -376,8 +477,6 @@ async fn rediscover_interfaces(
         // Clean up empty entries again
         unknown_metrics.retain(|_, metrics| !metrics.is_empty());
     }
-
-    Ok((added.len(), processed_count))
 }
 
 // Function to force detection of a specific interface by querying dladm directly
@@ -389,71 +488,7 @@ async fn force_interface_detection(
 ) -> Result<NetworkInterface> {
     debug!("Attempting to force detection of interface: {}", interface_name);
 
-    // Try to get accurate interface type by querying dladm directly for this specific interface
-    let output = Command::new("/usr/sbin/dladm")
-        .args(&["show-link", "-p", "-o", "link,class", interface_name])
-        .output()
-        .context(format!("Failed to run dladm show-link for {}", interface_name))?;
-
-    let link_output = String::from_utf8(output.stdout)
-        .context("Invalid UTF-8 in dladm output")?;
-
-    // Default values
-    let mut interface_type = "dev".to_string(); // Default type
-    let mut parent_interface = None;
-
-    // Parse dladm output to get actual interface type
-    for line in link_output.lines() {
-        let fields: Vec<&str> = line.split(':').collect();
-        if fields.len() >= 2 && fields[0] == interface_name {
-            interface_type = fields[1].to_string();
-            break;
-        }
-    }
-
-    // If it's a VNIC, get the parent interface
-    if interface_type == "vnic" {
-        let vnic_output = Command::new("/usr/sbin/dladm")
-            .args(&["show-vnic", "-p", "-o", "link,over", interface_name])
-            .output()
-            .context(format!("Failed to run dladm show-vnic for {}", interface_name))?;
-
-        let vnic_text = String::from_utf8(vnic_output.stdout)
-            .context("Invalid UTF-8 in dladm vnic output")?;
-
-        for line in vnic_text.lines() {
-            let fields: Vec<&str> = line.split(':').collect();
-            if fields.len() >= 2 && fields[0] == interface_name {
-                parent_interface = Some(fields[1].to_string());
-                break;
-            }
-        }
-    }
-
-    // If dladm didn't find the interface, fall back to guessing based on naming conventions
-    if link_output.trim().is_empty() {
-        debug!("Interface {} not found in dladm, using heuristics to determine type", interface_name);
-
-        interface_type = if interface_name.starts_with("igb") ||
-                          interface_name.starts_with("e1000g") ||
-                          interface_name.starts_with("bge") ||
-                          interface_name.starts_with("ixgbe") {
-            "phys".to_string()  // Physical device
-        } else if interface_name.ends_with("stub") ||
-                  interface_name.contains("stub") {
-            "etherstub".to_string()
-        } else if interface_name.ends_with("0") &&
-                  !interface_name.contains("gw") &&
-                  !interface_name.starts_with("igb") {
-            "bridge".to_string()  // Likely a bridge (ends with 0)
-        } else if interface_name.contains("overlay") {
-            "overlay".to_string()
-        } else if interface_name.contains("gw") {
-            "vnic".to_string()  // Gateway VNICs typically end with gw
-        } else {
-            "dev".to_string()  // Default to generic device if we can't determine
-        };
-    }
+    let (interface_type, parent_interface) = determine_interface_type_and_parent(interface_name).await?;
 
     // Create the interface record
     let interface_id = discovery::ensure_interface_exists(
@@ -484,6 +519,84 @@ async fn force_interface_detection(
          });
 
     Ok(interface)
+}
+
+async fn determine_interface_type_and_parent(interface_name: &str) -> Result<(String, Option<String>)> {
+    // Try to get accurate interface type by querying dladm directly for this specific interface
+    let output = Command::new("/usr/sbin/dladm")
+        .args(&["show-link", "-p", "-o", "link,class", interface_name])
+        .output()
+        .context(format!("Failed to run dladm show-link for {}", interface_name))?;
+
+    let link_output = String::from_utf8(output.stdout)
+        .context("Invalid UTF-8 in dladm output")?;
+
+    // Default values
+    let mut interface_type = "dev".to_string(); // Default type
+    let mut parent_interface = None;
+
+    // Parse dladm output to get actual interface type
+    for line in link_output.lines() {
+        let fields: Vec<&str> = line.split(':').collect();
+        if fields.len() >= 2 && fields[0] == interface_name {
+            interface_type = fields[1].to_string();
+            break;
+        }
+    }
+
+    // If it's a VNIC, get the parent interface
+    if interface_type == "vnic" {
+        parent_interface = get_vnic_parent(interface_name).await?;
+    }
+
+    // If dladm didn't find the interface, fall back to guessing based on naming conventions
+    if link_output.trim().is_empty() {
+        debug!("Interface {} not found in dladm, using heuristics to determine type", interface_name);
+        interface_type = guess_interface_type(interface_name);
+    }
+
+    Ok((interface_type, parent_interface))
+}
+
+async fn get_vnic_parent(interface_name: &str) -> Result<Option<String>> {
+    let vnic_output = Command::new("/usr/sbin/dladm")
+        .args(&["show-vnic", "-p", "-o", "link,over", interface_name])
+        .output()
+        .context(format!("Failed to run dladm show-vnic for {}", interface_name))?;
+
+    let vnic_text = String::from_utf8(vnic_output.stdout)
+        .context("Invalid UTF-8 in dladm vnic output")?;
+
+    for line in vnic_text.lines() {
+        let fields: Vec<&str> = line.split(':').collect();
+        if fields.len() >= 2 && fields[0] == interface_name {
+            return Ok(Some(fields[1].to_string()));
+        }
+    }
+
+    Ok(None)
+}
+
+fn guess_interface_type(interface_name: &str) -> String {
+    if interface_name.starts_with("igb") ||
+       interface_name.starts_with("e1000g") ||
+       interface_name.starts_with("bge") ||
+       interface_name.starts_with("ixgbe") {
+        "phys".to_string()  // Physical device
+    } else if interface_name.ends_with("stub") ||
+              interface_name.contains("stub") {
+        "etherstub".to_string()
+    } else if interface_name.ends_with("0") &&
+              !interface_name.contains("gw") &&
+              !interface_name.starts_with("igb") {
+        "bridge".to_string()  // Likely a bridge (ends with 0)
+    } else if interface_name.contains("overlay") {
+        "overlay".to_string()
+    } else if interface_name.contains("gw") {
+        "vnic".to_string()  // Gateway VNICs typically end with gw
+    } else {
+        "dev".to_string()  // Default to generic device if we can't determine
+    }
 }
 
 async fn process_metrics_batch(
@@ -615,22 +728,9 @@ fn continuous_dlstat_collection(tx: mpsc::Sender<MetricMessage>) -> Result<()> {
 
         // Check for header line which indicates a new section of data
         if line.contains("LINK") && line.contains("IPKTS") {
-            // If we were collecting a section and have metrics, send them
+            // Process completed section if we have metrics
             if is_collecting && !current_metrics.is_empty() {
-                // Create a message with the collected metrics
-                let message = MetricMessage {
-                    metrics: current_metrics,
-                };
-
-                trace!("Sending {} metrics from dlstat", message.metrics.len());
-
-                // Try to send the metrics to the channel
-                if let Err(e) = tx.blocking_send(message) {
-                    error!("Failed to send metrics: {}", e);
-                    break; // Receiver dropped, time to exit
-                }
-
-                // Reset for next batch
+                send_metrics_batch(&tx, &current_metrics)?;
                 current_metrics = Vec::new();
             }
 
@@ -651,31 +751,55 @@ fn continuous_dlstat_collection(tx: mpsc::Sender<MetricMessage>) -> Result<()> {
             continue;
         }
 
-        // Parse the line
-        let fields: Vec<&str> = line.split_whitespace().collect();
-        if fields.len() >= 5 {
-            let interface_name = fields[0].to_string();
-
-            // Parse the values - handle units (K, M, G) if present
-            let input_packets = parse_metric_value(fields[1])?;
-            let input_bytes = parse_metric_value(fields[2])?;
-            let output_packets = parse_metric_value(fields[3])?;
-            let output_bytes = parse_metric_value(fields[4])?;
-
-            current_metrics.push(NetworkMetric {
-                interface_name,
-                input_bytes,
-                input_packets,
-                output_bytes,
-                output_packets,
-                timestamp: Utc::now(),
-            });
+        // Parse the line and add to current batch
+        if let Some(metric) = parse_dlstat_line(&line)? {
+            current_metrics.push(metric);
         }
     }
 
     // If we get here, the process terminated
     warn!("dlstat process terminated");
     Ok(())
+}
+
+fn send_metrics_batch(tx: &mpsc::Sender<MetricMessage>, metrics: &[NetworkMetric]) -> Result<()> {
+    // Create a message with the collected metrics
+    let message = MetricMessage {
+        metrics: metrics.to_vec(),
+    };
+
+    trace!("Sending {} metrics from dlstat", message.metrics.len());
+
+    // Try to send the metrics to the channel
+    tx.blocking_send(message)
+        .map_err(|e| anyhow::anyhow!("Failed to send metrics: {}", e))?;
+
+    Ok(())
+}
+
+fn parse_dlstat_line(line: &str) -> Result<Option<NetworkMetric>> {
+    // Parse the line
+    let fields: Vec<&str> = line.split_whitespace().collect();
+    if fields.len() >= 5 {
+        let interface_name = fields[0].to_string();
+
+        // Parse the values - handle units (K, M, G) if present
+        let input_packets = parse_metric_value(fields[1])?;
+        let input_bytes = parse_metric_value(fields[2])?;
+        let output_packets = parse_metric_value(fields[3])?;
+        let output_bytes = parse_metric_value(fields[4])?;
+
+        return Ok(Some(NetworkMetric {
+            interface_name,
+            input_bytes,
+            input_packets,
+            output_bytes,
+            output_packets,
+            timestamp: Utc::now(),
+        }));
+    }
+
+    Ok(None)
 }
 
 // Helper function to parse values with K, M, G suffixes

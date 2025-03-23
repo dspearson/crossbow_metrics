@@ -20,40 +20,23 @@ async fn main() -> Result<()> {
     initialise_logging(&args);
 
     // Load configuration
-    let config = AppConfig::load(&args.config)
-        .context(format!("Failed to load config from {}", args.config))?;
+    let config = load_configuration(&args)?;
 
-    // Get database connection string
-    let db_url = config.get_connection_string();
+    // Get hostname
+    let hostname = determine_hostname(&args)?;
 
-    // Get max retries
-    let max_retries = config.max_retries.unwrap_or(5);
-
-    // Get system hostname if not provided
-    let hostname = match args.hostname {
-        Some(h) => h,
-        None => config::get_hostname()?,
-    };
-
+    // Display some basic info
     info!("Database hosts: {}", config.database.hosts.join(", "));
     debug!("Database connection URL format: postgresql://username:***@hosts/database");
 
-    // Connect to the database with TLS support
-    info!("Establishing database connection...");
-    let client = match database::establish_connection(&db_url, &config.database.sslmode).await {
-        Ok(client) => {
-            info!("Successfully connected to database");
-            client
-        },
-        Err(e) => {
-            error!("Critical error: Failed to establish database connection: {}", e);
-            error!("Aborting startup since database connection is required");
-            return Err(e);
-        }
-    };
+    // Connect to the database
+    let client = connect_to_database(&config).await?;
 
     // Start a background task to periodically check database connection health
     let _health_check_handle = database::start_connection_health_check(Arc::clone(&client));
+
+    // Get max retries
+    let max_retries = config.max_retries.unwrap_or(5);
 
     // Start the metrics collection loop
     info!("Starting metrics collection for host {}", hostname);
@@ -92,4 +75,35 @@ fn initialise_logging(args: &Args) {
 
     // Log startup information at debug level instead of info
     debug!("Logging initialized at level: {}", level);
+}
+
+fn load_configuration(args: &Args) -> Result<AppConfig> {
+    AppConfig::load(&args.config)
+        .context(format!("Failed to load config from {}", args.config))
+}
+
+fn determine_hostname(args: &Args) -> Result<String> {
+    match &args.hostname {
+        Some(h) => Ok(h.clone()),
+        None => config::get_hostname(),
+    }
+}
+
+async fn connect_to_database(config: &AppConfig) -> Result<Arc<tokio_postgres::Client>> {
+    // Get database connection string
+    let db_url = config.get_connection_string();
+
+    // Connect to the database with TLS support
+    info!("Establishing database connection...");
+    match database::establish_connection(&db_url, &config.database.sslmode).await {
+        Ok(client) => {
+            info!("Successfully connected to database");
+            Ok(client)
+        },
+        Err(e) => {
+            error!("Critical error: Failed to establish database connection: {}", e);
+            error!("Aborting startup since database connection is required");
+            Err(e)
+        }
+    }
 }
