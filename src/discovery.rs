@@ -403,7 +403,7 @@ async fn build_zone_interface_map(
     if zone_interface_map.is_empty() {
         warn!("WARNING: No zone-interface mappings found!");
     } else {
-        info!("Built zone-interface map with {} entries:", zone_interface_map.len());
+        info!("Built zone-interface map with {} entries", zone_interface_map.len());
 
         for (interface, zone_uuid) in &zone_interface_map {
             // Find zone name for the UUID
