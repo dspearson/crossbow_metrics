@@ -102,10 +102,9 @@ pub async fn discover_interfaces(
     max_retries: usize,
 ) -> Result<HashMap<String, NetworkInterface>> {
     let mut interfaces = HashMap::new();
-    let mut zone_interface_map = HashMap::new();
+    let zone_interface_map: HashMap<String, Uuid> = HashMap::new();
 
-    // First, get all interfaces that might appear in dlstat
-    // We'll use dladm show-link for this, which shows all datalinks
+    // Get all datalinks (including physical, etherstub, vnic)
     let output = Command::new("/usr/sbin/dladm")
         .args(&["show-link", "-p", "-o", "link,class"])
         .output()
@@ -114,18 +113,20 @@ pub async fn discover_interfaces(
     let link_output = String::from_utf8(output.stdout)
         .context("Invalid UTF-8 in dladm output")?;
 
-    // Create a mapping of all interfaces and their types
-    let mut interface_types = HashMap::new();
+    println!("Discovering all interfaces...");
+
+    // Process all links
     for line in link_output.lines() {
         let fields: Vec<&str> = line.split(':').collect();
         if fields.len() >= 2 {
             let interface_name = fields[0].to_string();
             let interface_type = fields[1].to_string();
-            interface_types.insert(interface_name, interface_type);
+
+            println!("Found interface: {} (type: {})", interface_name, interface_type);
         }
     }
 
-    // Now get VNIC information (to establish parent relationships)
+    // Get VNIC parent relationships
     let vnic_output = Command::new("/usr/sbin/dladm")
         .args(&["show-vnic", "-p", "-o", "link,over"])
         .output()
@@ -145,131 +146,102 @@ pub async fn discover_interfaces(
         }
     }
 
-    // For each zone, find what interfaces are assigned to it
-    // We skip the global zone because it's handled differently
-    for (zone_name, zone_id) in zones {
-        if zone_name == "global" {
-            continue;
-        }
+    // First process all physical interfaces
+    for line in link_output.lines() {
+        let fields: Vec<&str> = line.split(':').collect();
+        if fields.len() >= 2 {
+            let interface_name = fields[0].to_string();
+            let interface_type = fields[1].to_string();
 
-        // Use zonecfg to get all net resources for the zone
-        let zonecfg_output = Command::new("/usr/sbin/zonecfg")
-            .args(&["-z", zone_name, "info", "net"])
-            .output()
-            .context(format!("Failed to run zonecfg for zone {}", zone_name))?;
+            if interface_type == "phys" {
+                // It's a physical interface
+                let interface_id = ensure_interface_exists(
+                    Arc::clone(&client),
+                    host_id,
+                    None, // Physical interfaces are in global zone
+                    interface_name.clone(),
+                    interface_type.clone(),
+                    None, // No parent for physical interfaces
+                    max_retries,
+                ).await?;
 
-        let zonecfg_output = String::from_utf8(zonecfg_output.stdout)
-            .context("Invalid UTF-8 in zonecfg output")?;
-
-
-        let mut current_interface: Option<String> = None;
-        let mut current_parent: Option<String> = None;
-
-        for line in zonecfg_output.lines() {
-            let line = line.trim();
-
-            if line.starts_with("net:") {
-                // If we have collected a complete interface entry, store it
-                if let (Some(interface), Some(parent)) = (&current_interface, &current_parent) {
-                    println!("Mapped interface {} (parent: {}) to zone {}",
-                          interface, parent, zone_name);
-                    vnic_parents.insert(interface.clone(), parent.clone());
-                }
-
-                // Reset for the next interface
-                current_interface = None;
-                current_parent = None;
-            } else if line.starts_with("physical:") {
-                if let Some(parts) = line.split_once(':') {
-                    let interface_name = parts.1.trim().to_string();
-                    current_interface = Some(interface_name.clone());
-
-                    // Map this interface to this zone
-                    zone_interface_map.insert(interface_name, *zone_id);
-                }
-            } else if line.starts_with("global-nic:") {
-                if let Some(parts) = line.split_once(':') {
-                    let parent_name = parts.1.trim().to_string();
-                    current_parent = Some(parent_name);
-                }
+                interfaces.insert(interface_name.clone(), NetworkInterface {
+                    interface_id,
+                    host_id,
+                    zone_id: None,
+                    interface_name,
+                    interface_type,
+                    parent_interface: None,
+                });
             }
         }
-
-        // Handle the last interface in the output if there is one
-        if let (Some(interface), Some(parent)) = (&current_interface, &current_parent) {
-            println!("Mapped interface {} (parent: {}) to zone {}",
-                  interface, parent, zone_name);
-            vnic_parents.insert(interface.clone(), parent.clone());
-        }
     }
 
-    // Now process all interfaces, using the zone mapping we've built
-    // First check dlstat directly to get all interfaces it knows about
-    let dlstat_output = Command::new("/usr/sbin/dlstat")
-        .output()
-        .context("Failed to run dlstat command")?;
-
-    let dlstat_output = String::from_utf8(dlstat_output.stdout)
-        .context("Invalid UTF-8 in dlstat output")?;
-
-    let mut line_count = 0;
-    let mut all_dlstat_interfaces = Vec::new();
-
-    for line in dlstat_output.lines() {
-        line_count += 1;
-
-        // Skip header lines
-        if line_count <= 2 {
-            continue;
-        }
-
-        let fields: Vec<&str> = line.split_whitespace().collect();
-        if fields.len() >= 5 {
+    // Next process all etherstubs
+    for line in link_output.lines() {
+        let fields: Vec<&str> = line.split(':').collect();
+        if fields.len() >= 2 {
             let interface_name = fields[0].to_string();
-            all_dlstat_interfaces.push(interface_name);
+            let interface_type = fields[1].to_string();
+
+            if interface_type == "etherstub" {
+                // It's an etherstub
+                let interface_id = ensure_interface_exists(
+                    Arc::clone(&client),
+                    host_id,
+                    None, // Etherstubs are in global zone
+                    interface_name.clone(),
+                    interface_type.clone(),
+                    None, // No parent for etherstubs
+                    max_retries,
+                ).await?;
+
+                interfaces.insert(interface_name.clone(), NetworkInterface {
+                    interface_id,
+                    host_id,
+                    zone_id: None,
+                    interface_name,
+                    interface_type,
+                    parent_interface: None,
+                });
+            }
         }
     }
 
-    // Finally, register all interfaces with their correct zone and type information
-    for interface_name in all_dlstat_interfaces {
-        let interface_type = interface_types.get(&interface_name)
-            .cloned()
-            .unwrap_or_else(|| {
-                // Make an educated guess based on naming conventions
-                if interface_name.starts_with("igb") ||
-                   interface_name.starts_with("e1000g") ||
-                   interface_name.starts_with("bge") ||
-                   interface_name.starts_with("ixgbe") {
-                    "physical".to_string()
-                } else {
-                    "unknown".to_string()
-                }
-            });
+    // Finally process all VNICs
+    for line in link_output.lines() {
+        let fields: Vec<&str> = line.split(':').collect();
+        if fields.len() >= 2 {
+            let interface_name = fields[0].to_string();
+            let interface_type = fields[1].to_string();
 
-        let parent_interface = vnic_parents.get(&interface_name).cloned();
+            if interface_type == "vnic" {
+                // It's a VNIC - get its parent
+                let parent_interface = vnic_parents.get(&interface_name).cloned();
 
-        // Get the zone_id for this interface
-        let zone_id = zone_interface_map.get(&interface_name).cloned();
+                // Get the zone_id for this interface (default to None for global zone)
+                let zone_id = zone_interface_map.get(&interface_name).cloned();
 
-        // Store interface in database and get UUID
-        let interface_id = ensure_interface_exists(
-            Arc::clone(&client),
-            host_id,
-            zone_id,
-            interface_name.clone(),
-            interface_type.clone(),
-            parent_interface.clone(),
-            max_retries,
-        ).await?;
+                let interface_id = ensure_interface_exists(
+                    Arc::clone(&client),
+                    host_id,
+                    zone_id,
+                    interface_name.clone(),
+                    interface_type.clone(),
+                    parent_interface.clone(),
+                    max_retries,
+                ).await?;
 
-        interfaces.insert(interface_name.clone(), NetworkInterface {
-            interface_id,
-            host_id,
-            zone_id,
-            interface_name,
-            interface_type,
-            parent_interface,
-        });
+                interfaces.insert(interface_name.clone(), NetworkInterface {
+                    interface_id,
+                    host_id,
+                    zone_id,
+                    interface_name,
+                    interface_type,
+                    parent_interface,
+                });
+            }
+        }
     }
 
     println!("Discovered {} interfaces", interfaces.len());
@@ -277,9 +249,9 @@ pub async fn discover_interfaces(
         let zone_info = match interface.zone_id {
             Some(id) => {
                 let zone_name = zones.iter()
-                                     .find(|&(_, zone_id)| *zone_id == id)  // Use explicit reference pattern
-                                     .map(|(name, _)| name.clone())
-                                     .unwrap_or_else(|| "unknown".to_string());
+                    .find(|&(_, zone_id)| *zone_id == id)
+                    .map(|(name, _)| name.clone())
+                    .unwrap_or_else(|| "unknown".to_string());
                 format!("zone: {}", zone_name)
             },
             None => "global zone".to_string(),
