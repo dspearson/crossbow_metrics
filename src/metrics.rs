@@ -72,7 +72,6 @@ pub async fn start_continuous_metrics_collection() -> Result<mpsc::Receiver<Metr
     Ok(rx)
 }
 
-// Function to run in the background thread that continuously reads from dlstat
 fn continuous_dlstat_collection(tx: mpsc::Sender<MetricMessage>) -> Result<()> {
     // Start dlstat with interval mode
     let mut child = Command::new("/usr/sbin/dlstat")
@@ -115,14 +114,20 @@ fn continuous_dlstat_collection(tx: mpsc::Sender<MetricMessage>) -> Result<()> {
             section_count += 1;
             line_count = 0;
 
-            // Skip the first section (initial counts)
+            // Skip the first section (cumulative stats since boot)
+            // Only start collecting from the second section onwards
             is_collecting = section_count > 1;
+
+            println!("Section {}: {} metrics collection",
+                    section_count,
+                    if is_collecting { "Starting" } else { "Skipping" });
+
             continue;
         }
 
         line_count += 1;
 
-        // Skip header lines
+        // Skip header lines and don't process the first section
         if line_count <= 1 || !is_collecting {
             continue;
         }
