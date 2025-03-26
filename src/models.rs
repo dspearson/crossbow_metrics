@@ -1,3 +1,4 @@
+use crate::errors;
 use chrono::{DateTime, Utc};
 use crate::database;
 use crate::discovery;
@@ -34,6 +35,7 @@ pub struct NetworkInterface {
 #[derive(Debug, Clone)]
 pub struct NetworkMetric {
     pub interface_name: String,
+    pub interface_id: Option<Uuid>,  // Add this field
     pub input_bytes: i64,
     pub input_packets: i64,
     pub output_bytes: i64,
@@ -699,44 +701,55 @@ async fn store_metric(
     metric: &NetworkMetric,
     max_retries: usize,
 ) -> Result<()> {
-    // Use our existing execute_with_retry function, not macready's
-    database::execute_with_retry(
-        || {
-            let client = Arc::clone(&client);
-            let timestamp = metric.timestamp;
-            let input_bytes = metric.input_bytes;
-            let input_packets = metric.input_packets;
-            let output_bytes = metric.output_bytes;
-            let output_packets = metric.output_packets;
-            let interface_id = interface_id;
+    // Create retry config
+    let retry_config = macready::retry::RetryConfig {
+        max_attempts: max_retries,
+        initial_delay_ms: 100,
+        backoff_factor: 1.5,
+        max_delay_ms: 30_000,
+        jitter: true,
+    };
 
-            Box::pin(async move {
-                client
-                    .execute(
-                        "INSERT INTO netmetrics (
-                    interface_id, timestamp,
-                    input_bytes, input_packets, output_bytes, output_packets,
-                    collection_method
-                    ) VALUES ($1, $2, $3, $4, $5, $6, $7)",
-                        &[
-                            &interface_id,
-                            &timestamp,
-                            &input_bytes,
-                            &input_packets,
-                            &output_bytes,
-                            &output_packets,
-                            &"dlstat",
-                        ],
-                    )
-                    .await
-                    .context("Failed to insert metrics")
-            })
-        },
-        max_retries,
+    // Use macready's retry function directly
+    errors::to_anyhow_result(
+        macready::retry::execute_with_retry(
+            || {
+                let client = Arc::clone(&client);
+                let timestamp = metric.timestamp;
+                let input_bytes = metric.input_bytes;
+                let input_packets = metric.input_packets;
+                let output_bytes = metric.output_bytes;
+                let output_packets = metric.output_packets;
+                let interface_id = interface_id;
+
+                Box::pin(async move {
+                    client
+                        .execute(
+                            "INSERT INTO netmetrics (
+                        interface_id, timestamp,
+                        input_bytes, input_packets, output_bytes, output_packets,
+                        collection_method
+                        ) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                            &[
+                                &interface_id,
+                                &timestamp,
+                                &input_bytes,
+                                &input_packets,
+                                &output_bytes,
+                                &output_packets,
+                                &"dlstat",
+                            ],
+                        )
+                        .await
+                        .map(|_| ()) // Convert u64 to () to match Result<(), _>
+                        .map_err(|e| macready::error::AgentError::Database(e.to_string()))
+                })
+            },
+            retry_config,
+            "store_metric",
+        )
+        .await
     )
-    .await?;
-
-    Ok(())
 }
 
 // Start a continuous metrics collection in the background
@@ -845,6 +858,7 @@ fn parse_dlstat_line(line: &str) -> Result<Option<NetworkMetric>> {
 
         return Ok(Some(NetworkMetric {
             interface_name,
+            interface_id: None,  // Add this field
             input_bytes,
             input_packets,
             output_bytes,

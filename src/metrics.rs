@@ -1,3 +1,4 @@
+use crate::errors;
 use crate::database;
 use crate::discovery;
 use crate::models::{NetworkInterface, NetworkMetric};
@@ -637,48 +638,89 @@ async fn process_metrics_batch(
 }
 
 // Helper function to store a single metric
+
 async fn store_metric(
     client: Arc<Client>,
     interface_id: Uuid,
     metric: &NetworkMetric,
     max_retries: usize,
 ) -> Result<()> {
-    // Use database::execute_with_retry instead of macready_retry
-    database::execute_with_retry(
-        || {
-            let client = Arc::clone(&client);
-            let timestamp = metric.timestamp;
-            let input_bytes = metric.input_bytes;
-            let input_packets = metric.input_packets;
-            let output_bytes = metric.output_bytes;
-            let output_packets = metric.output_packets;
-            let interface_id = interface_id;
+    // Create retry config
+    let retry_config = macready::retry::RetryConfig {
+        max_attempts: max_retries,
+        initial_delay_ms: 100,
+        backoff_factor: 1.5,
+        max_delay_ms: 30_000,
+        jitter: true,
+    };
 
-            Box::pin(async move {
-                client
-                    .execute(
-                        "INSERT INTO netmetrics (
-                    interface_id, timestamp,
-                    input_bytes, input_packets, output_bytes, output_packets,
-                    collection_method
-                    ) VALUES ($1, $2, $3, $4, $5, $6, $7)",
-                        &[
-                            &interface_id,
-                            &timestamp,
-                            &input_bytes,
-                            &input_packets,
-                            &output_bytes,
-                            &output_packets,
-                            &"dlstat",
-                        ],
-                    )
-                    .await
-                    .context("Failed to insert metrics")
-            })
-        },
-        max_retries,
+    // Use macready's retry function directly
+    errors::to_anyhow_result(
+        macready::retry::execute_with_retry(
+            || {
+                let client = Arc::clone(&client);
+                let timestamp = metric.timestamp;
+                let input_bytes = metric.input_bytes;
+                let input_packets = metric.input_packets;
+                let output_bytes = metric.output_bytes;
+                let output_packets = metric.output_packets;
+                let interface_id = interface_id;
+
+                Box::pin(async move {
+                    let _result = client
+                        .execute(
+                            "INSERT INTO netmetrics (
+                        interface_id, timestamp,
+                        input_bytes, input_packets, output_bytes, output_packets,
+                        collection_method
+                        ) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                            &[
+                                &interface_id,
+                                &timestamp,
+                                &input_bytes,
+                                &input_packets,
+                                &output_bytes,
+                                &output_packets,
+                                &"dlstat",
+                            ],
+                        )
+                        .await
+                        .map_err(|e| macready::error::AgentError::Database(e.to_string()))?;
+
+                    Ok(())
+                })
+            },
+            retry_config,
+            "store_metric",
+        )
+        .await
     )
-    .await
+}
+
+fn parse_dlstat_line(line: &str) -> Result<Option<NetworkMetric>> {
+    // Parse the line
+    let fields: Vec<&str> = line.split_whitespace().collect();
+    if fields.len() >= 5 {
+        let interface_name = fields[0].to_string();
+
+        // Parse the values - handle units (K, M, G) if present
+        let input_packets = parse_metric_value(fields[1])?;
+        let input_bytes = parse_metric_value(fields[2])?;
+        let output_packets = parse_metric_value(fields[3])?;
+        let output_bytes = parse_metric_value(fields[4])?;
+
+        return Ok(Some(NetworkMetric {
+            interface_name,
+            interface_id: None, // We don't know the ID yet
+            input_bytes,
+            input_packets,
+            output_bytes,
+            output_packets,
+            timestamp: Utc::now(),
+        }));
+    }
+
+    Ok(None)
 }
 
 // Start a continuous metrics collection in the background
@@ -771,31 +813,6 @@ fn send_metrics_batch(tx: &mpsc::Sender<MetricMessage>, metrics: &[NetworkMetric
         .map_err(|e| anyhow::anyhow!("Failed to send metrics: {}", e))?;
 
     Ok(())
-}
-
-fn parse_dlstat_line(line: &str) -> Result<Option<NetworkMetric>> {
-    // Parse the line
-    let fields: Vec<&str> = line.split_whitespace().collect();
-    if fields.len() >= 5 {
-        let interface_name = fields[0].to_string();
-
-        // Parse the values - handle units (K, M, G) if present
-        let input_packets = parse_metric_value(fields[1])?;
-        let input_bytes = parse_metric_value(fields[2])?;
-        let output_packets = parse_metric_value(fields[3])?;
-        let output_bytes = parse_metric_value(fields[4])?;
-
-        return Ok(Some(NetworkMetric {
-            interface_name,
-            input_bytes,
-            input_packets,
-            output_bytes,
-            output_packets,
-            timestamp: Utc::now(),
-        }));
-    }
-
-    Ok(None)
 }
 
 // Helper function to parse values with K, M, G suffixes

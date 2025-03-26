@@ -1,4 +1,5 @@
-use crate::database::execute_with_retry;
+use macready::retry::{execute_with_retry, RetryConfig};
+use crate::errors;
 use crate::models::NetworkInterface;
 use anyhow::{Context, Error, Result};
 use log::{debug, info, trace, warn};
@@ -7,6 +8,17 @@ use std::process::Command;
 use std::sync::Arc;
 use tokio_postgres::Client;
 use uuid::Uuid;
+
+// Helper function to create a RetryConfig with standard settings
+fn create_retry_config(max_retries: usize) -> RetryConfig {
+    RetryConfig {
+        max_attempts: max_retries,
+        initial_delay_ms: 100,
+        backoff_factor: 1.5,
+        max_delay_ms: 30_000,
+        jitter: true,
+    }
+}
 
 // Function to get MAC address and MTU for an interface
 async fn get_interface_details(interface_name: &str) -> Result<(Option<String>, Option<i64>)> {

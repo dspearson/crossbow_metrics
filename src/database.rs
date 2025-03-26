@@ -1,25 +1,24 @@
 use crate::errors;
-use tokio::time;
 use anyhow::{Context, Result};
 use log::{debug, error, info, trace, warn};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_postgres::Client;
 
-use macready::connection::health::HealthCheck;
-use macready::connection::postgres::PostgresProvider;
+// Re-export macready's retry function for use in other modules
+pub use macready::retry::{execute_with_retry, RetryConfig};
+use macready::connection::health::HealthStatus;
 
 pub async fn establish_connection(db_url: &str, sslmode: &str) -> Result<Arc<Client>> {
     // We're using the database_adapter as an intermediary to convert the connection string
-    // to the macready format while we incrementally migrate
     crate::database_adapter::establish_connection(db_url, sslmode).await
 }
 
-// This function can now be simplified as health checking will be handled by macready
+// Keep this function for compatibility with main.rs
 pub async fn start_connection_health_check(client: Arc<Client>) -> tokio::task::JoinHandle<()> {
     info!("Starting periodic database connection health checks");
     tokio::spawn(async move {
-        let mut interval = time::interval(Duration::from_secs(30));
+        let mut interval = tokio::time::interval(Duration::from_secs(30));
 
         loop {
             interval.tick().await;
@@ -35,7 +34,6 @@ pub async fn start_connection_health_check(client: Arc<Client>) -> tokio::task::
     })
 }
 
-// Temporary validation function that will be replaced by macready's health check
 pub async fn validate_connection(client: Arc<Client>) -> Result<()> {
     debug!("Validating database connection...");
 
@@ -74,16 +72,29 @@ pub async fn ensure_host_exists(
     let hostname = hostname.to_string(); // Clone to avoid reference issues
 
     // Use the existing execute_with_retry function with anyhow Result
-    execute_with_retry(
-        move || {
-            let client = Arc::clone(&client);
-            let hostname = hostname.clone();
+    let retry_config = RetryConfig {
+        max_attempts: max_retries,
+        initial_delay_ms: 100,
+        backoff_factor: 1.5,
+        max_delay_ms: 30_000,
+        jitter: true,
+    };
 
-            Box::pin(async move { find_or_create_host(&client, &hostname).await })
-        },
-        max_retries,
+    errors::to_anyhow_result(
+        execute_with_retry(
+            || {
+                let client = Arc::clone(&client);
+                let hostname = hostname.clone();
+
+                Box::pin(async move {
+                    errors::to_macready_result(find_or_create_host(&client, &hostname).await)
+                })
+            },
+            retry_config,
+            "ensure_host_exists",
+        )
+        .await
     )
-    .await
 }
 
 async fn find_or_create_host(client: &Client, hostname: &str) -> Result<uuid::Uuid> {
@@ -117,37 +128,4 @@ async fn create_new_host(client: &Client, hostname: &str) -> Result<uuid::Uuid> 
         .context("Failed to insert host")?;
     info!("Created new host record: {}", host_id);
     Ok(host_id)
-}
-
-// This function can be adapted to use macready's retry logic
-pub async fn execute_with_retry<F, T>(
-    f: F,
-    max_retries: usize,
-) -> Result<T>
-where
-    F: Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<T>> + Send>> + Send + Sync,
-{
-    // Create a retry config that matches our existing behavior
-    let retry_config = macready::retry::RetryConfig {
-        max_attempts: max_retries,
-        initial_delay_ms: 100,
-        backoff_factor: 1.5,
-        max_delay_ms: 30_000,
-        jitter: true,
-    };
-
-    // Use macready's retry function and convert the result back
-    errors::to_anyhow_result(
-        macready::retry::execute_with_retry(
-            || {
-                let future = f();
-                Box::pin(async move {
-                    errors::to_macready_result(future.await)
-                })
-            },
-            retry_config,
-            "database_operation",
-        )
-        .await,
-    )
 }
