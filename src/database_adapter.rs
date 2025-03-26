@@ -1,11 +1,13 @@
 // src/database_adapter.rs
 use anyhow::Result;
+use log::{debug, info};
 use macready::config::{DatabaseConfig, SslMode};
-use macready::connection::health::HealthStatus;
+use macready::connection::health::{HealthCheck, HealthStatus};
 use macready::connection::postgres::PostgresProvider;
 use std::sync::Arc;
 use tokio_postgres::Client;
 
+/// Establish a connection to the database using macready
 pub async fn establish_connection(
     db_url: &str,
     sslmode: &str,
@@ -24,6 +26,8 @@ pub async fn establish_connection(
         _ => SslMode::Disable,
     };
 
+    debug!("Connecting to database with SSL mode: {}", sslmode);
+
     let db_config = DatabaseConfig {
         host: hosts.first().unwrap_or(&"localhost".to_string()).clone(),
         port: 5432,
@@ -36,8 +40,10 @@ pub async fn establish_connection(
         client_key: None,
     };
 
-    // For now, let's fall back to the original connection method
-    // because of the type compatibility issues
+    // For the initial port, we'll use tokio-postgres directly
+    // because it matches the existing API better
+    info!("Establishing database connection to {}:{}/{}", db_config.host, db_config.port, db_config.name);
+
     let (client, connection) = tokio_postgres::connect(db_url, tokio_postgres::NoTls)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to connect to database: {}", e))?;
@@ -52,8 +58,12 @@ pub async fn establish_connection(
     // Create a health check for this connection
     let health_status = Arc::new(HealthStatus::new("database_connection"));
 
-    // For a more integrated approach, we'd wrap this client with health checks
-    // But for now, we'll keep it simple
+    // Test a simple query to verify the connection works
+    client.execute("SELECT 1", &[])
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to execute test query: {}", e))?;
+
+    info!("Successfully connected to database");
 
     Ok(Arc::new(client))
 }
@@ -83,7 +93,11 @@ fn parse_db_url(url: &str) -> Result<(String, String, Vec<String>, String)> {
         return Err(anyhow::anyhow!("Invalid host/database format"));
     }
 
-    let hosts = vec![host_and_db[0].to_string()];
+    // Handle port in host part
+    let host_parts: Vec<&str> = host_and_db[0].split(':').collect();
+    let host = host_parts[0].to_string();
+
+    let hosts = vec![host];
     let database = host_and_db[1].to_string();
 
     Ok((username, password, hosts, database))

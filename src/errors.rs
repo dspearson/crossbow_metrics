@@ -1,4 +1,4 @@
-// src/error.rs
+// src/errors.rs - Renamed from error.rs to avoid confusion with log::error
 use macready::error::AgentError;
 
 /// Convert from macready's error type to anyhow's error type

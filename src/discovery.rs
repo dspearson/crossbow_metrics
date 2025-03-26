@@ -873,6 +873,7 @@ async fn get_interface_id(
     }, max_retries)
     .await
 }
+
 async fn is_new_interface(
     client: &Arc<Client>,
     interface_id: Uuid,

@@ -4,7 +4,7 @@ mod database;
 mod discovery;
 mod metrics;
 mod models;
-mod error;
+mod errors;
 mod database_adapter;
 
 use anyhow::{Context, Result};
