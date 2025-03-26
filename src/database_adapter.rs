@@ -3,7 +3,6 @@ use anyhow::Result;
 use log::{debug, info};
 use macready::config::{DatabaseConfig, SslMode};
 use macready::connection::health::{HealthCheck, HealthStatus};
-use macready::connection::postgres::PostgresProvider;
 use std::sync::Arc;
 use tokio_postgres::Client;
 
@@ -56,7 +55,7 @@ pub async fn establish_connection(
     });
 
     // Create a health check for this connection
-    let health_status = Arc::new(HealthStatus::new("database_connection"));
+    let _health_status = Arc::new(HealthStatus::new("database_connection"));
 
     // Test a simple query to verify the connection works
     client.execute("SELECT 1", &[])

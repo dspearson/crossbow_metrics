@@ -1,7 +1,7 @@
+use chrono::{DateTime, Utc};
 use crate::database;
 use crate::discovery;
 use anyhow::{Context, Result};
-use chrono::Utc;
 use log::{debug, error, info, trace, warn};
 use macready::buffer::{BufferConfig, MetricsBuffer};
 use std::collections::{HashMap, HashSet};
@@ -13,6 +13,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_postgres::Client;
 use uuid::Uuid;
+use macready::entity::Entity;
 
 // Configuration constants for buffer management
 const MAX_BUFFER_AGE_MINUTES: i64 = 10; // Maximum age of buffered metrics
@@ -20,10 +21,66 @@ const MAX_METRICS_PER_INTERFACE: usize = 100; // Maximum metrics to buffer per i
 const MAX_BUFFER_SIZE: usize = 1000; // Total maximum buffer size across all interfaces
 const INTERFACE_DETECTION_THRESHOLD: usize = 5; // Minimum metrics to trigger forced detection
 
+#[derive(Debug, Clone)]
+pub struct NetworkInterface {
+    pub interface_id: Uuid,
+    pub host_id: Uuid,
+    pub zone_id: Option<Uuid>,
+    pub interface_name: String,
+    pub interface_type: String,
+    pub parent_interface: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NetworkMetric {
+    pub interface_name: String,
+    pub input_bytes: i64,
+    pub input_packets: i64,
+    pub output_bytes: i64,
+    pub output_packets: i64,
+    pub timestamp: DateTime<Utc>,
+}
+
 // Define a struct for the metric message
 #[derive(Debug, Clone)]
 pub struct MetricMessage {
     pub metrics: Vec<NetworkMetric>,
+}
+
+// Implement macready's Entity trait for NetworkInterface
+impl Entity for NetworkInterface {
+    type Id = Uuid;
+
+    fn id(&self) -> &Self::Id {
+        &self.interface_id
+    }
+
+    fn name(&self) -> &str {
+        &self.interface_name
+    }
+
+    fn entity_type(&self) -> &str {
+        &self.interface_type
+    }
+
+    fn is_active(&self) -> bool {
+        true
+    }
+
+    fn parent_id(&self) -> Option<&Self::Id> {
+        self.zone_id.as_ref()
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "interface_id": self.interface_id,
+            "host_id": self.host_id,
+            "zone_id": self.zone_id,
+            "interface_name": self.interface_name,
+            "interface_type": self.interface_type,
+            "parent_interface": self.parent_interface
+        })
+    }
 }
 
 // Structure to track interface changes
@@ -820,48 +877,5 @@ fn parse_metric_value(value_str: &str) -> Result<i64> {
     match value_str.parse::<f64>() {
         Ok(value) => Ok((value * multiplier as f64) as i64),
         Err(_) => Err(anyhow::anyhow!("Failed to parse value: {}", value_str)),
-    }
-}
-
-// Implement macready's MetricPoint trait for NetworkMetric
-impl macready::collector::MetricPoint for NetworkMetric {
-    // We need to specify this as just NetworkInterface - not the fully qualified path
-    type EntityType = NetworkInterface;
-
-    fn entity_id(&self) -> Option<&<Self::EntityType as macready::entity::Entity>::Id> {
-        None // We don't have the entity ID in the metric yet - it gets resolved later
-    }
-
-    fn entity_name(&self) -> &str {
-        &self.interface_name
-    }
-
-    fn timestamp(&self) -> chrono::DateTime<Utc> {
-        self.timestamp
-    }
-
-    fn values(&self) -> std::collections::HashMap<String, i64> {
-        let mut values = std::collections::HashMap::new();
-        values.insert("input_bytes".to_string(), self.input_bytes);
-        values.insert("input_packets".to_string(), self.input_packets);
-        values.insert("output_bytes".to_string(), self.output_bytes);
-        values.insert("output_packets".to_string(), self.output_packets);
-        values
-    }
-
-    fn to_json(&self) -> serde_json::Value {
-        serde_json::json!({
-            "interface_name": self.interface_name,
-            "interface_id": null, // We don't have the ID yet
-            "input_bytes": self.input_bytes,
-            "input_packets": self.input_packets,
-            "output_bytes": self.output_bytes,
-            "output_packets": self.output_packets,
-            "timestamp": self.timestamp.to_rfc3339(),
-        })
-    }
-
-    fn collection_method(&self) -> &str {
-        "dlstat"
     }
 }

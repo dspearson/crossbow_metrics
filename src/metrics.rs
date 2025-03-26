@@ -5,7 +5,6 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use log::{debug, error, info, trace, warn};
 use macready::buffer::{BufferConfig, MetricsBuffer};
-use macready::retry::execute_with_retry as macready_retry;
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
@@ -644,16 +643,8 @@ async fn store_metric(
     metric: &NetworkMetric,
     max_retries: usize,
 ) -> Result<()> {
-    // Convert to macready retry format
-    let retry_config = macready::retry::RetryConfig {
-        max_attempts: max_retries,
-        initial_delay_ms: 100,
-        backoff_factor: 1.5,
-        max_delay_ms: 30_000,
-        jitter: true,
-    };
-
-    macready_retry(
+    // Use database::execute_with_retry instead of macready_retry
+    database::execute_with_retry(
         || {
             let client = Arc::clone(&client);
             let timestamp = metric.timestamp;
@@ -685,13 +676,9 @@ async fn store_metric(
                     .context("Failed to insert metrics")
             })
         },
-        retry_config,
-        "store_metric",
+        max_retries,
     )
     .await
-    .map_err(|e| anyhow::anyhow!("Failed to store metric: {}", e))?;
-
-    Ok(())
 }
 
 // Start a continuous metrics collection in the background
