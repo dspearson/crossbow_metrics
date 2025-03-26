@@ -1,8 +1,11 @@
+// src/main.rs - add macready dependency
 mod config;
 mod database;
 mod discovery;
 mod metrics;
 mod models;
+mod error;
+mod database_adapter;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -94,7 +97,7 @@ async fn connect_to_database(config: &AppConfig) -> Result<Arc<tokio_postgres::C
 
     // Connect to the database with TLS support
     info!("Establishing database connection...");
-    match database::establish_connection(&db_url, &config.database.sslmode).await {
+    match database_adapter::establish_connection(&db_url, &config.database.sslmode).await {
         Ok(client) => {
             info!("Successfully connected to database");
             Ok(client)
